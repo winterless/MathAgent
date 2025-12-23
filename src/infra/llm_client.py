@@ -1,32 +1,17 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
-
-
-def _env(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.environ.get(name)
-    if v is None or v == "":
-        return default
-    return v
+from typing import Any, Dict, List
 
 
 @dataclass(frozen=True)
 class LLMConfig:
     """
     Minimal OpenAI-compatible config (HTTP only).
-
-    Expected env vars:
-    - LLM_BASE_URL: e.g. https://api.openai.com or http://127.0.0.1:8000
-    - LLM_API_KEY:  your key (optional for many local servers)
-    - LLM_MODEL:    model id exposed by server
-    Optional:
-    - LLM_TIMEOUT_S: request timeout (default 60)
     """
 
     base_url: str
@@ -35,26 +20,26 @@ class LLMConfig:
     timeout_s: int = 60
 
     @staticmethod
-    def from_env() -> "LLMConfig":
-        base_url = _env("LLM_BASE_URL", "") or ""
-        api_key = _env("LLM_API_KEY", "") or ""
-        model = _env("LLM_MODEL", "") or ""
-        timeout_s = int(_env("LLM_TIMEOUT_S", "60") or "60")
+    def from_dict(d: Dict[str, Any]) -> "LLMConfig":
+        base_url = str(d.get("base_url") or "")
+        api_key = str(d.get("api_key") or "")
+        model = str(d.get("model") or "")
+        timeout_s = int(d.get("timeout_s") or 60)
         return LLMConfig(base_url=base_url, api_key=api_key, model=model, timeout_s=timeout_s)
 
 
 class LLMClient:
-    def __init__(self, config: Optional[LLMConfig] = None) -> None:
-        self.config = config or LLMConfig.from_env()
+    def __init__(self, *, config: LLMConfig) -> None:
+        self.config = config
 
     def _ensure_http_config(self) -> None:
         missing = []
         if not self.config.base_url:
-            missing.append("LLM_BASE_URL")
+            missing.append("base_url")
         if not self.config.model:
-            missing.append("LLM_MODEL")
+            missing.append("model")
         if missing:
-            raise RuntimeError("Missing LLM config env vars: " + ", ".join(missing) + ".")
+            raise RuntimeError("Missing LLM config fields: " + ", ".join(missing) + ".")
 
     def chat_once(self, *, system: str, user: str, temperature: float = 0.2, max_tokens: int = 512) -> str:
         """

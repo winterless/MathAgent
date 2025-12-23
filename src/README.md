@@ -10,26 +10,13 @@
 Example: `datasets/example_input.jsonl`
 
 ## Run (real OpenAI-compatible API)
-Fill env vars (leave blank until you have the API):
+### Use the model routing config (single mode)
+
+Edit `config/llm_models.json` to describe your **three models** (e.g. 30B 快思考 / 30B 慢思考 / 基础模型),
+and how each pipeline stage routes to them, then run:
 
 ```bash
-# 本地 OpenAI-compatible 服务（最常见：vLLM，默认端口 8000）
-export LLM_BASE_URL="http://127.0.0.1:8000"
-# 多数本地服务不校验 key，可留空；如你的服务需要再填写
-export LLM_API_KEY=""
-# 必须与你的服务端实际暴露的 model id 完全一致（可用 curl 查看）：
-# curl http://127.0.0.1:8000/v1/models
-# 你当前 vLLM 暴露的是（注意：默认就是 --model 的完整路径）：
-export LLM_MODEL="Qwen3-8B"
-#
-# 如果你想用更短的名字（如 Qwen3-8B），需要你启动 vLLM 时加：
-# python -m vllm.entrypoints.openai.api_server --model /path/to/Qwen3-8B --served-model-name Qwen3-8B --port 8000
-
-# 如果你用的是 OpenAI 官方接口，改为：
-# export LLM_BASE_URL="https://api.openai.com"
-# export LLM_API_KEY="sk-..."
-# export LLM_MODEL="gpt-4o-mini"
-python src/run_pipeline.py --input datasets/example_input.jsonl --out datasets/out/demo
+python src/run_pipeline.py --input datasets/example_input.jsonl --out datasets/out/demo --llm-config config/llm_models.json
 ```
 
 Optional flags:

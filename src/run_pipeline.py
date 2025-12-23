@@ -22,7 +22,7 @@ from core.stages import (
     standardize_choice_answer,
 )
 from core.voting import majority_vote
-from infra.llm_client import LLMClient
+from infra.llm_router import LLMRouter
 from dataio.jsonl_io import iter_jsonl, write_jsonl_atomic
 from dataio.sample_schema import CANONICAL_KEYS, normalize_output_wrapper, normalize_record
 
@@ -41,6 +41,11 @@ def main() -> None:
     p.add_argument("--input", required=True, help="Input JSONL path (one JSON object per line).")
     p.add_argument("--out", default=_default_out_dir(), help="Output directory (default datasets/out/<timestamp>)")
     p.add_argument("--sleep", type=float, default=0.0, help="Sleep seconds between LLM calls (rate limit)")
+    p.add_argument(
+        "--llm-config",
+        default="config/llm_models.json",
+        help="Path to JSON config describing models + stage routing.",
+    )
     args = p.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -51,7 +56,7 @@ def main() -> None:
     stage2_output_path = os.path.join(args.out, "stage2_output.jsonl")
     stage3_output_path = os.path.join(args.out, "stage3_output.jsonl")
 
-    llm = LLMClient()
+    llm = LLMRouter(config_path=args.llm_config)
 
     try:
         shutil.copyfile(args.input, raw_input_copy_path)

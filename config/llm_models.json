@@ -1,0 +1,31 @@
+{
+  "models": {
+    "base": {
+      "base_url": "http://127.0.0.1:8000",
+      "api_key": "",
+      "model": "Qwen3-8B",
+      "timeout_s": 120
+    },
+    "think_fast": {
+      "base_url": "http://127.0.0.1:8000",
+      "api_key": "",
+      "model": "Qwen3-8B",
+      "timeout_s": 120
+    },
+    "think_slow": {
+      "base_url": "http://127.0.0.1:8000",
+      "api_key": "",
+      "model": "Qwen3-8B",
+      "timeout_s": 300
+    }
+  },
+  "routes": {
+    "default": "base",
+    "stage1_solve": "think_fast",
+    "stage1_eval": "think_slow",
+    "stage2_eval": "think_slow",
+    "stage3_eval": "think_slow"
+  }
+}
+
+
