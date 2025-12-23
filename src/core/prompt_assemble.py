@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import List
 
-
 # This is the prompt stored in JSON, and should match datasets/sample.jsonl style:
 # a standard header + (question + standard answer + 8 answers). No output-template here.
 STORED_PROMPT_HEADER = (
@@ -55,5 +54,6 @@ def assemble_stored_prompt(*, question: str, standard_answer: str, stage1_answer
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
+
 
 

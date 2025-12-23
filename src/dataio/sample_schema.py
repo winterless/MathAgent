@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 JsonDict = Dict[str, Any]
 
@@ -28,12 +28,9 @@ def normalize_output_wrapper(output: Any, *, uuid: Any = None, stage: str = "sta
     Normalize an "output" wrapper to match datasets/sample.jsonl's shape as closely as possible.
     Unknown fields are mocked with safe defaults.
     """
-    # We align keys to sample.jsonl:
-    # output: { status, content: { id, object, model, choices, usage, prefill_time } }
     existing = output if isinstance(output, dict) else {}
     existing_content = existing.get("content") if isinstance(existing.get("content"), dict) else {}
 
-    # message.content (preserve if present)
     content_str = ""
     tool_calls = None
     if isinstance(existing_content, dict):
@@ -45,10 +42,8 @@ def normalize_output_wrapper(output: Any, *, uuid: Any = None, stage: str = "sta
                     content_str = msg["content"]
                 tool_calls = msg.get("tool_calls", None)
 
-    # Build a strictly-shaped wrapper (drop unknown keys).
     out_choices: List[JsonDict] = []
     if isinstance(existing_content.get("choices"), list) and existing_content["choices"]:
-        # Keep first choice, but normalize its shape.
         c0 = existing_content["choices"][0]
         if not isinstance(c0, dict):
             c0 = {}
@@ -113,9 +108,8 @@ def normalize_record(row: JsonDict) -> JsonDict:
     for k in CANONICAL_KEYS:
         out[k] = row.get(k, "" if k not in ("line_number", "output") else (None if k == "line_number" else {}))
 
-    # Normalize output wrapper *shape* while preserving its content when present.
-    # For raw inputs (no output yet), this becomes an empty wrapper.
     out["output"] = normalize_output_wrapper(row.get("output"), uuid=out.get("uuid"), stage="input")
     return out
+
 
 

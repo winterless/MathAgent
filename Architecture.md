@@ -1,24 +1,27 @@
-# MathAgent：高难度数学题筛选与答案生成流程
+# MathAgent Architecture（按功能分层）
 
-![Architecture](diagrams/architecture.png)
+![Architecture](others/diagrams/architecture.png)
 
-```mermaid
-flowchart TD
-  A[输入：题目（无答案）] --> B[Stage 1：4B 快思考 ×8]
-  B --> C{Major voting 一致数 > n ?<br/>例如 n=7}
-  C -- 是 --> X[判定：简单题\n结束（不入库）]
-  C -- 否 --> D[Stage 2：30B 快思考 ×8]
-  D --> E{Major voting 一致数 > n ?<br/>例如 n=7}
-  E -- 是 --> S[存储：题目 + 多数答案]
-  E -- 否 --> F[Stage 3：30B Thinking ×8]
-  F --> G{Major voting 一致数 > n ?<br/>例如 n=7}
-  G -- 是 --> S
-  G -- 否 --> Y[丢弃：无法稳定产出答案]
-```
+### 分层目录结构（源码）
 
-## 判定与产出
+- **CLI layer**：`src/run_pipeline.py`
+  - 唯一入口，串联 Stage1/2/3，负责读写 JSONL（内部调用 `src/core|io|infra` 模块）
+- **Core layer（Domain）**：`src/core/`
+  - `stages.py`：题目归一化、选项映射、答案抽取（支持 `FINAL:`）、boxed 统计解析
+  - `prompt_assemble.py`：拼装 `sample.jsonl` 风格的 `prompt`
+  - `voting.py`：多数投票
+- **IO layer**：`src/dataio/`
+  - `jsonl_io.py`：JSONL 读写（原子写入）
+  - `sample_schema.py`：输出 schema 对齐 `datasets/sample.jsonl`
+- **Infra layer**：`src/infra/`
+  - `llm_client.py`：OpenAI-compatible HTTP 客户端（vLLM/OpenAI 均可）
 
-- **一致性判定**：每个 Stage 生成 8 个答案，用 **major voting** 统计“最多数答案”的出现次数；若 **> n** 则认为答案稳定。
-- **输出数据**：仅当 Stage 2 或 Stage 3 达到稳定一致性时，**存储（题目 + 多数答案）**；否则按流程 **结束或丢弃**。
+### Pipeline（运行时数据流）
+
+- **输入**：`--input <path>.jsonl`（包含 `question` 与 `answer`）
+- **Stage1 solve**：对每题采样 8 次（允许输出推理，最后一行 `FINAL: ...`），写入 `stage1_raw_generations.jsonl`
+- **Stage1 eval**：把 8 个答案拼入 `prompt`，再调用 evaluator 输出长 Markdown，写入 `stage1_output.jsonl`
+- **Stage2/Stage3（最简）**：仅当上一阶段 output 里解析不到 `\\boxed{解答正确：x，解答错误：y}` 才会重评并写入下一阶段 JSONL
+
 
 

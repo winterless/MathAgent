@@ -5,7 +5,6 @@ import os
 import tempfile
 from typing import Any, Dict, Iterable, Iterator, Optional
 
-
 JsonDict = Dict[str, Any]
 
 
@@ -51,4 +50,6 @@ def write_jsonl_atomic(path: str, rows: Iterable[JsonDict]) -> None:
                     os.remove(tmp_path)
             except OSError:
                 pass
+
+
 

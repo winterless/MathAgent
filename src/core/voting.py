@@ -26,3 +26,4 @@ def majority_vote(answers: List[str]) -> VoteResult:
     return VoteResult(majority=majority, majority_count=majority_count, counts=dict(c))
 
 
+
