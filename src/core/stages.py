@@ -8,11 +8,14 @@ JsonDict = Dict[str, Any]
 _ABCD_RE = re.compile(r"(?<![A-Za-z0-9])[ABCD](?![A-Za-z0-9])")
 _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
 _BOXED_ANS_RE = re.compile(r"\\boxed\s*\{\s*(?P<ans>[ABCD])\s*\}", re.IGNORECASE)
+_BOXED_ANY_RE = re.compile(r"\\boxed\s*\{\s*(?P<ans>[^}]+?)\s*\}", re.IGNORECASE)
 _ANSWER_LINE_RE = re.compile(r"(?:最终答案|答案)\s*[:：]?\s*(?P<ans>[ABCD])", re.IGNORECASE)
 _FINAL_LINE_RE = re.compile(r"(?mi)^\s*FINAL\s*[:：]\s*(?P<ans>.+?)\s*$")
 _ANSWER_ANY_LINE_RE = re.compile(r"(?mi)^\s*(?:最终答案|答案)\s*[:：]?\s*(?P<ans>.+?)\s*$")
 _CHOICE_LINE_RE = re.compile(r"(?m)^\s*([ABCD])\s*[\.．、]\s*(.+?)\s*$")
 _CHOICE_MAP_LINE_RE = re.compile(r"(?m)^\s*([ABCD])\s*=\s*(.+?)\s*$")
+_CHOICE_PREFIX_RE = re.compile(r"^\s*([ABCD])\s*[\.．、=:]\s*(.+?)\s*$", re.IGNORECASE)
+_CHOICE_ONLY_RE = re.compile(r"^\s*([ABCD])\s*$", re.IGNORECASE)
 
 _BOXED_RE = re.compile(
     r"\\boxed\s*\{\s*解答正确\s*：\s*(?P<ok>\d+)\s*[，,]\s*解答错误\s*：\s*(?P<bad>\d+)\s*\}",
@@ -92,7 +95,18 @@ def extract_final_answer(text: str) -> str:
 
     finals = list(_FINAL_LINE_RE.finditer(s))
     if finals:
-        return (finals[-1].group("ans") or "").strip()
+        raw = (finals[-1].group("ans") or "").strip()
+        # Handle common patterns like:
+        # - FINAL: \boxed{A}
+        # - FINAL: A.-5
+        # - FINAL: A
+        m_box2 = _BOXED_ANS_RE.search(raw)
+        if m_box2:
+            return m_box2.group("ans").upper()
+        letter = _extract_choice_letter(raw)
+        if letter:
+            return letter
+        return raw
 
     m_line = _ANSWER_LINE_RE.search(s)
     if m_line:
@@ -100,7 +114,14 @@ def extract_final_answer(text: str) -> str:
 
     ans_lines = list(_ANSWER_ANY_LINE_RE.finditer(s))
     if ans_lines:
-        return (ans_lines[-1].group("ans") or "").strip()
+        raw = (ans_lines[-1].group("ans") or "").strip()
+        m_box3 = _BOXED_ANS_RE.search(raw)
+        if m_box3:
+            return m_box3.group("ans").upper()
+        letter = _extract_choice_letter(raw)
+        if letter:
+            return letter
+        return raw
 
     tail = s[-300:]
     m = list(_ABCD_RE.finditer(tail))
@@ -114,6 +135,145 @@ def extract_final_answer(text: str) -> str:
     lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
     return lines[-1] if lines else s.strip()
 
+
+def extract_boxed_answer(text: str) -> str:
+    """
+    Extract the *last* \\boxed{...} content from a model output.
+    Returns inner text (trimmed) or "" if not found.
+    """
+    s = strip_think(text)
+    if not s:
+        return ""
+    boxes = list(_BOXED_ANY_RE.finditer(s))
+    if not boxes:
+        return ""
+    return (boxes[-1].group("ans") or "").strip()
+
+
+def _normalize_cmp(s: str) -> str:
+    s2 = (s or "").strip()
+    # remove surrounding math delimiters
+    if s2.startswith("$") and s2.endswith("$") and len(s2) >= 2:
+        s2 = s2[1:-1].strip()
+    s2 = s2.replace("，", ",").replace("：", ":")
+    s2 = re.sub(r"\s+", "", s2)
+    return s2
+
+
+def _try_parse_fraction(s: str) -> float | None:
+    ss = (s or "").strip()
+    m = re.fullmatch(r"(-?\d+)\s*/\s*(-?\d+)", ss)
+    if m:
+        a = float(m.group(1))
+        b = float(m.group(2))
+        if b == 0:
+            return None
+        return a / b
+    # latex \frac{a}{b}
+    m2 = re.fullmatch(r"\\frac\{(-?\d+)\}\{(-?\d+)\}", ss)
+    if m2:
+        a = float(m2.group(1))
+        b = float(m2.group(2))
+        if b == 0:
+            return None
+        return a / b
+    return None
+
+
+def _strip_choice_prefix(s: str) -> str:
+    """
+    If s looks like 'A.<value>' or 'B=<value>', return '<value>' part.
+    Otherwise return s as-is.
+    """
+    if not isinstance(s, str):
+        return s  # type: ignore[return-value]
+    m = _CHOICE_PREFIX_RE.match(s.strip())
+    if not m:
+        return s
+    return (m.group(2) or "").strip()
+
+
+def _extract_choice_letter(s: str) -> str | None:
+    """
+    Extract a leading choice letter A/B/C/D from common formats:
+    - 'A'
+    - 'A. ...', 'A=...'
+    Returns uppercase letter or None.
+    """
+    if not isinstance(s, str):
+        return None
+    ss = s.strip()
+    m0 = _CHOICE_ONLY_RE.match(ss)
+    if m0:
+        return (m0.group(1) or "").upper()
+    m1 = _CHOICE_PREFIX_RE.match(ss)
+    if m1:
+        return (m1.group(1) or "").upper()
+    return None
+
+
+def _coerce_number(s: str) -> float | None:
+    if not isinstance(s, str):
+        return None
+    ss = s.strip()
+    x = _try_parse_number(ss)
+    if x is not None:
+        return x
+    x = _try_parse_fraction(ss)
+    if x is not None:
+        return x
+    return None
+
+
+def rule_equivalent(pred: str, gold: str, *, choice_map: Dict[str, str], tol: float = 1e-4) -> bool | None:
+    """
+    Rule-first equivalence check.
+    Returns:
+    - True/False when we can confidently judge
+    - None when unsure (caller may escalate to LLM judge)
+    """
+    if not isinstance(pred, str) or not pred.strip():
+        return False
+    if not isinstance(gold, str) or not gold.strip():
+        return None
+
+    p = pred.strip()
+    g = gold.strip()
+
+    # For MCQ: if we can reliably read the option letter(s), decide without LLM.
+    p_letter = _extract_choice_letter(p)
+    g_letter = _extract_choice_letter(g)
+    if p_letter and g_letter:
+        return p_letter == g_letter
+    if p_letter and g_letter is None and g in ("A", "B", "C", "D"):
+        # Defensive (should be covered by g_letter), keep deterministic.
+        return p_letter == g
+    if g_letter and p_letter is None and p in ("A", "B", "C", "D"):
+        return g_letter == p
+
+    # Normalize choice answers (A -> A.<value>)
+    p_std = standardize_choice_answer(p, choice_map=choice_map)
+    g_std = standardize_choice_answer(g, choice_map=choice_map)
+
+    if _normalize_cmp(p_std) == _normalize_cmp(g_std):
+        return True
+
+    # Compare if one side is choice letter and the other is value
+    if p in ("A", "B", "C", "D") and p in choice_map:
+        if _normalize_cmp(choice_map[p]) == _normalize_cmp(g) or _normalize_cmp(choice_map[p]) == _normalize_cmp(g_std):
+            return True
+    if g in ("A", "B", "C", "D") and g in choice_map:
+        if _normalize_cmp(choice_map[g]) == _normalize_cmp(p) or _normalize_cmp(choice_map[g]) == _normalize_cmp(p_std):
+            return True
+
+    # Numeric tolerance
+    pn = _coerce_number(_strip_choice_prefix(p_std))
+    gn = _coerce_number(_strip_choice_prefix(g_std))
+    if pn is not None and gn is not None:
+        return abs(pn - gn) <= tol
+
+    # Unknown expression forms -> unsure
+    return None
 
 def _try_parse_number(s: str) -> float | None:
     if not isinstance(s, str):

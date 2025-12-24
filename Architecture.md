@@ -23,7 +23,7 @@
 - **Stage1 eval**：把 8 个答案拼入 `prompt`，再调用 evaluator 输出长 Markdown，写入 `stage1_output.jsonl`
 - **难度记录（最小化即可）**：从 Stage1 eval 的最后一行 `\\boxed{解答正确：x，解答错误：y}` 中解析 `x/y` 并记录难度
   - **难度定义（建议）**：`difficulty = 解答错误数量 = y = 8 - x`
-  - **进入 Stage2 的条件**：`x <= 4`（等价于 `difficulty >= 4`；你描述为“难度大于4”，这里按“正确<=4”作为硬阈值）
+  - **进入 Stage2 的条件**：`y >= 4`（等价于 `x <= 4`）
 
 ### Stage2（难题二次推理与规则优先验算）
 
@@ -33,8 +33,8 @@ Stage2 仅对“难题”执行，目标是：用更强/更慢的模型做 8 次
   - **uuid**
   - **difficulty**（以及 Stage1 的 `x/y` 作为来源）
 - **Stage2 路由规则**
-  - 若 `x > 4`：跳过 Stage2，直接处理下一条
-  - 若 `x <= 4`：进入 Stage2
+  - 若 `stage1_bad < 4`：跳过 Stage2，直接处理下一条
+  - 若 `stage1_bad >= 4`：进入 Stage2
 - **Stage2 推理（模型调用）**
   - 对每个问题调用 Stage2 模型 **8 次**
   - **提问内容**：只提供 **question**（不再拼接 Stage1 的 8 个答案/长评测 prompt）
@@ -54,19 +54,19 @@ Stage2 仅对“难题”执行，目标是：用更强/更慢的模型做 8 次
   - 归档条目建议包含：`uuid`、`difficulty(x/y)`、`question`、`gold_answer`、`attempts[]`
     - `attempts[]`：每次推理的 `raw_text`、`boxed_answer`、`verdict(正确/错误/不确定->已裁决)`、`judge_reason(可选)`
 - **Stage2 产出与 Stage3 判定**
-  - 在“规则优先 + 模型裁决”后得到该题的总体判别结果
-  - 若仍满足 `x <= 4`（难题阈值）：进入 Stage3
+  - 在“规则优先 + 模型裁决”后得到该题的总体判别结果（统计 `stage2_ok/stage2_bad`）
+  - 若 `stage2_bad >= 4`：进入 Stage3
   - 否则：将该题的归档结果写入题库目录（问题、推理结果列表、答案、uuid、难度）
 
 ### Stage3（复用 Stage2 的判别/归档逻辑；难题仍可放弃）
 
-- **进入条件**：Stage2 后仍是难题（`x <= 4`）
+- **进入条件**：Stage2 后 `stage2_bad >= 4`
 - **执行内容**：重复 Stage2 的
   - 抽取器（boxed）
   - 规则系统优先判别 + 不确定样本的模型裁决
   - 8 次推理完整信息 + 标签列表归档
 - **结束条件**
-  - 若 Stage3 后仍是难题（`x <= 4`）：**放弃该题**（不进入题库）
+  - 若 Stage3 后 `stage3_bad >= 4`：**放弃该题**（不进入题库）
   - 否则：同样归档到题库目录
 
 

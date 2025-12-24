@@ -23,9 +23,13 @@
     "default": "base",
     "stage1_solve": "think_fast",
     "stage1_eval": "think_slow",
-    "stage2_eval": "think_slow",
-    "stage3_eval": "think_slow"
+    "stage1_judge": "think_slow",
+    "stage2_solve": "think_fast",
+    "stage2_judge": "think_slow",
+    "stage3_solve": "think_slow",
+    "stage3_judge": "think_slow"
   }
 }
+
 
 
