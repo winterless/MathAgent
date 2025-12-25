@@ -4,30 +4,69 @@
       "base_url": "http://127.0.0.1:8000",
       "api_key": "",
       "model": "Qwen3-8B",
-      "timeout_s": 120
+      "timeout_s": 120,
+      "retry_max": 1,
+      "retry_backoff_s": 1.0,
+      "retry_backoff_mult": 2.0,
+      "retry_jitter_s": 0.2
     },
     "think_fast": {
       "base_url": "http://127.0.0.1:8000",
       "api_key": "",
       "model": "Qwen3-8B",
-      "timeout_s": 120
+      "timeout_s": 120,
+      "retry_max": 1,
+      "retry_backoff_s": 1.0,
+      "retry_backoff_mult": 2.0,
+      "retry_jitter_s": 0.2
     },
     "think_slow": {
       "base_url": "http://127.0.0.1:8000",
       "api_key": "",
       "model": "Qwen3-8B",
-      "timeout_s": 300
+      "timeout_s": 300,
+      "retry_max": 1,
+      "retry_backoff_s": 1.0,
+      "retry_backoff_mult": 2.0,
+      "retry_jitter_s": 0.2
+    }
+  },
+  "stage_params": {
+    "default": { "n": 1, "temperature": 0.8, "max_tokens": 16384 },
+    "stage1_solve": { "n": 8, "temperature": 2, "max_tokens": 16384 },
+    "stage1_eval":  { "n": 1, "temperature": 0, "max_tokens": 16384 },
+    "stage1_judge": { "n": 1, "temperature": 0, "max_tokens": 16384 },
+    "stage2_solve": { "n": 8, "temperature": 2, "max_tokens": 16384 },
+    "stage2_judge": { "n": 1, "temperature": 0, "max_tokens": 16384 },
+    "stage3_solve": { "n": 8, "temperature": 2, "max_tokens": 16384 },
+    "stage3_judge": { "n": 1, "temperature": 0, "max_tokens": 16384 }
+  },
+  "thresholds": {
+    "min_ok_to_accept": 5
+  },
+  "options": {
+    "finish_early": true,
+    "debug_print_prompts": true,
+    "debug_print_prompts_max_chars": 4000,
+    "debug_print_outputs": true,
+    "debug_print_outputs_max_chars": 2000,
+    "debug_stream_outputs": true,
+    "think_tag_default": "",
+    "think_tag_by_stage": {
+      "stage1_solve": "/no_think",
+      "stage2_solve": "/no_think",
+      "stage3_solve": "/think"
     }
   },
   "routes": {
     "default": "base",
     "stage1_solve": "think_fast",
     "stage1_eval": "think_slow",
-    "stage1_judge": "think_slow",
+    "stage1_judge": "think_fast",
     "stage2_solve": "think_fast",
-    "stage2_judge": "think_slow",
+    "stage2_judge": "think_fast",
     "stage3_solve": "think_slow",
-    "stage3_judge": "think_slow"
+    "stage3_judge": "think_fast"
   }
 }
 

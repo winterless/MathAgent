@@ -40,6 +40,7 @@ class LLMRouterConfig:
     routes: Dict[str, str]
     stage_params: Dict[str, StageParams]
     thresholds: Dict[str, Any]
+    options: Dict[str, Any]
 
     @staticmethod
     def load(path: str) -> "LLMRouterConfig":
@@ -51,6 +52,7 @@ class LLMRouterConfig:
         raw_routes = raw.get("routes", {})
         raw_stage_params = raw.get("stage_params", {})
         raw_thresholds = raw.get("thresholds", {})
+        raw_options = raw.get("options", {})
         if not isinstance(raw_models, dict):
             raise ValueError(f"Invalid llm config: models must be an object: {path}")
         if not isinstance(raw_routes, dict):
@@ -59,6 +61,8 @@ class LLMRouterConfig:
             raise ValueError(f"Invalid llm config: stage_params must be an object: {path}")
         if raw_thresholds is not None and not isinstance(raw_thresholds, dict):
             raise ValueError(f"Invalid llm config: thresholds must be an object: {path}")
+        if raw_options is not None and not isinstance(raw_options, dict):
+            raise ValueError(f"Invalid llm config: options must be an object: {path}")
         models: Dict[str, LLMConfig] = {}
         for name, cfg in raw_models.items():
             if not isinstance(name, str):
@@ -83,8 +87,9 @@ class LLMRouterConfig:
                 stage_params[k] = StageParams(n=n, temperature=temperature, max_tokens=max_tokens)
 
         thresholds: Dict[str, Any] = raw_thresholds if isinstance(raw_thresholds, dict) else {}
+        options: Dict[str, Any] = raw_options if isinstance(raw_options, dict) else {}
 
-        return LLMRouterConfig(models=models, routes=routes, stage_params=stage_params, thresholds=thresholds)
+        return LLMRouterConfig(models=models, routes=routes, stage_params=stage_params, thresholds=thresholds, options=options)
 
 
 class LLMRouter:
@@ -104,6 +109,7 @@ class LLMRouter:
         self._routes: Dict[str, str] = cfg.routes
         self._stage_params: Dict[str, StageParams] = cfg.stage_params
         self._thresholds: Dict[str, Any] = cfg.thresholds
+        self._options: Dict[str, Any] = cfg.options
         self._clients: Dict[str, LLMClient] = {}
 
         for name, llm_cfg in cfg.models.items():
@@ -135,6 +141,51 @@ class LLMRouter:
         except Exception:
             return default
 
+    def option_bool(self, name: str, default: bool) -> bool:
+        v = self._options.get(name)
+        if v is None:
+            return bool(default)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("1", "true", "yes", "y", "on", "enable", "enabled"):
+                return True
+            if s in ("0", "false", "no", "n", "off", "disable", "disabled"):
+                return False
+        return bool(default)
+
+    def option_str(self, name: str, default: str) -> str:
+        v = self._options.get(name)
+        if v is None:
+            return str(default)
+        if isinstance(v, str):
+            return v
+        return str(v)
+
+    def option_int(self, name: str, default: int) -> int:
+        v = self._options.get(name)
+        try:
+            return int(v)
+        except Exception:
+            return int(default)
+
+    def think_tag_for_stage(self, stage_name: str) -> str:
+        """
+        Returns a prefix tag to inject into user content for some models (e.g. Qwen /think or /no_think).
+        Config keys:
+          - options.think_tag_default: string
+          - options.think_tag_by_stage: { "<stage_name>": "<tag>" }
+        """
+        by_stage = self._options.get("think_tag_by_stage")
+        if isinstance(by_stage, dict):
+            v = by_stage.get((stage_name or "").strip())
+            if isinstance(v, str):
+                return v
+        return self.option_str("think_tag_default", "")
+
     def _pick_client(self, stage_name: str) -> LLMClient:
         key = (stage_name or "").strip()
         model_name = self._routes.get(key) or self._routes.get("default") or ""
@@ -154,6 +205,14 @@ class LLMRouter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         sleep_s: float = 0.0,
+        stats: Optional[Dict[str, int]] = None,
+        finish_early: Optional[bool] = None,
+        think_tag: Optional[str] = None,
+        debug_print_prompts: Optional[bool] = None,
+        debug_print_prompts_max_chars: Optional[int] = None,
+        debug_print_outputs: Optional[bool] = None,
+        debug_print_outputs_max_chars: Optional[int] = None,
+        debug_stream_outputs: Optional[bool] = None,
     ):
         p = self.stage_params(stage_name)
         client = self._pick_client(stage_name)
@@ -165,6 +224,24 @@ class LLMRouter:
             temperature=p.temperature if temperature is None else float(temperature),
             max_tokens=p.max_tokens if max_tokens is None else int(max_tokens),
             sleep_s=sleep_s,
+            stats=stats,
+            finish_early=self.option_bool("finish_early", True) if finish_early is None else bool(finish_early),
+            think_tag=self.think_tag_for_stage(stage_name) if think_tag is None else str(think_tag),
+            debug_print_prompts=self.option_bool("debug_print_prompts", False)
+            if debug_print_prompts is None
+            else bool(debug_print_prompts),
+            debug_print_prompts_max_chars=self.option_int("debug_print_prompts_max_chars", 4000)
+            if debug_print_prompts_max_chars is None
+            else int(debug_print_prompts_max_chars),
+            debug_print_outputs=self.option_bool("debug_print_outputs", False)
+            if debug_print_outputs is None
+            else bool(debug_print_outputs),
+            debug_print_outputs_max_chars=self.option_int("debug_print_outputs_max_chars", 2000)
+            if debug_print_outputs_max_chars is None
+            else int(debug_print_outputs_max_chars),
+            debug_stream_outputs=self.option_bool("debug_stream_outputs", False)
+            if debug_stream_outputs is None
+            else bool(debug_stream_outputs),
         )
 
 

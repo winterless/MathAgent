@@ -54,19 +54,29 @@ def main() -> None:
 
     os.makedirs(args.out, exist_ok=True)
 
-    raw_input_copy_path = os.path.join(args.out, "example_input.jsonl")
-    stage1_output_path = os.path.join(args.out, "stage1_output.jsonl")
-    stage1_raw_generations_path = os.path.join(args.out, "stage1_raw_generations.jsonl")
-    stage2_archive_path = os.path.join(args.out, "stage2_archive.jsonl")
-    stage3_archive_path = os.path.join(args.out, "stage3_archive.jsonl")
-    accepted_bank_path = os.path.join(args.out, "accepted_bank.jsonl")
-    discarded_hard_path = os.path.join(args.out, "discarded_hard.jsonl")
+    raw_input_copy_path = os.path.join(args.out, "example_input.stage0.jsonl")
+    stage1_output_path = os.path.join(args.out, "stage1_output.stage1.jsonl")
+    stage1_raw_generations_path = os.path.join(args.out, "stage1_raw_generations.stage1.jsonl")
+    stage2_archive_path = os.path.join(args.out, "stage2_archive.stage2.jsonl")
+    stage3_archive_path = os.path.join(args.out, "stage3_archive.stage3.jsonl")
+    accepted_bank_path = os.path.join(args.out, "accepted_bank.stage_final.jsonl")
+    discarded_hard_path = os.path.join(args.out, "discarded_hard.stage_final.jsonl")
 
     llm = LLMRouter(config_path=args.llm_config)
     min_ok_to_accept = llm.threshold_int("min_ok_to_accept", 5)
+    stage1_okbad_by_uuid: Dict[Any, tuple[int, int]] = {}
 
     # ---- Shared judge helper (Stage1/2/3) ----
-    def _llm_judge_equivalence(*, uuid: Any, question: str, gold: str, pred: str, choice_map: Dict[str, str], stage: str) -> bool | None:
+    def _llm_judge_equivalence(
+        *,
+        uuid: Any,
+        question: str,
+        gold: str,
+        pred: str,
+        choice_map: Dict[str, str],
+        stage: str,
+        stats: Dict[str, int] | None = None,
+    ) -> bool | None:
         """
         Ask LLM to judge equivalence only when rules cannot decide.
         Return True/False/None.
@@ -89,6 +99,7 @@ def main() -> None:
             question=user,
             prompt_mode="raw_prompt",
             sleep_s=args.sleep,
+            stats=stats,
         )[0]
         t = (resp or "").strip()
         # Be strict: accept only the 3 allowed outputs (optionally with trivial punctuation).
@@ -123,11 +134,13 @@ def main() -> None:
             raise ValueError(f"Missing gold in field 'answer': uuid={uuid}")
 
         model_q = append_choice_map_if_any(normalize_for_model(q_raw))
+        s1_solve_stats: Dict[str, int] = {}
         raw_solutions = llm.generate_n(
             stage_name="stage1_solve",
             question=model_q,
             prompt_mode="problem",
             sleep_s=args.sleep,
+            stats=s1_solve_stats,
         )
 
         extracted = [extract_final_answer(x) for x in raw_solutions]
@@ -139,6 +152,7 @@ def main() -> None:
         # Stage1 uses the same extractor + rule-first judge (LLM fallback) as Stage2/Stage3.
         stage1_attempts: List[Dict[str, Any]] = []
         ok1 = 0
+        s1_judge_stats: Dict[str, int] = {}
         for raw, extracted_i, pred_i in zip(raw_solutions[:8], extracted[:8], standardized[:8]):
             boxed_i = extract_boxed_answer(raw)
             extracted_final = boxed_i or extracted_i
@@ -153,6 +167,7 @@ def main() -> None:
                     pred=pred_final,
                     choice_map=choice_map,
                     stage="stage1",
+                    stats=s1_judge_stats,
                 )
                 judge_src = "llm" if eq is not None else "unknown"
             verdict = "正确" if eq is True else ("错误" if eq is False else "不确定")
@@ -189,14 +204,24 @@ def main() -> None:
                     "stage1_eval": 0,  # filled after eval (may retry once)
                     "stage1_judge_llm_fallback": sum(1 for a in stage1_attempts if a.get("judge_source") == "llm"),
                     "stage1_judge_unknown": sum(1 for a in stage1_attempts if a.get("judge_source") == "unknown"),
+                    "stage1_solve_http_calls": int(s1_solve_stats.get("http_calls", 0)),
+                    "stage1_solve_retries": int(s1_solve_stats.get("retries", 0)),
+                    "stage1_solve_timeouts": int(s1_solve_stats.get("timeouts", 0)),
+                    "stage1_solve_errors": int(s1_solve_stats.get("errors", 0)),
+                    "stage1_judge_http_calls": int(s1_judge_stats.get("http_calls", 0)),
+                    "stage1_judge_retries": int(s1_judge_stats.get("retries", 0)),
+                    "stage1_judge_timeouts": int(s1_judge_stats.get("timeouts", 0)),
+                    "stage1_judge_errors": int(s1_judge_stats.get("errors", 0)),
                 },
             }
         )
+        stage1_okbad_by_uuid[uuid] = (ok1, 8 - ok1)
 
         eval_user = f"{stored_prompt}\n\n[GOLD_STANDARD_ANSWER]={gold}\n"
         # Evaluate once; if boxed counts missing, retry once immediately so routing/metrics are consistent.
         eval_calls = 0
         eval_text = ""
+        s1_eval_stats: Dict[str, int] = {}
         for _ in range(2):
             eval_calls += 1
             eval_text = llm.generate_n(
@@ -204,11 +229,16 @@ def main() -> None:
                 question=eval_user,
                 prompt_mode="raw_prompt_eval",
                 sleep_s=args.sleep,
+                stats=s1_eval_stats,
             )[0]
             eval_text = strip_think(eval_text)
             if extract_boxed_counts(eval_text) is not None:
                 break
         stage1_raw_archive_rows[-1]["llm_call_counts"]["stage1_eval"] = eval_calls
+        stage1_raw_archive_rows[-1]["llm_call_counts"]["stage1_eval_http_calls"] = int(s1_eval_stats.get("http_calls", 0))
+        stage1_raw_archive_rows[-1]["llm_call_counts"]["stage1_eval_retries"] = int(s1_eval_stats.get("retries", 0))
+        stage1_raw_archive_rows[-1]["llm_call_counts"]["stage1_eval_timeouts"] = int(s1_eval_stats.get("timeouts", 0))
+        stage1_raw_archive_rows[-1]["llm_call_counts"]["stage1_eval_errors"] = int(s1_eval_stats.get("errors", 0))
         out = normalize_output_wrapper(
             {
                 "status": "SUCCESS",
@@ -243,6 +273,11 @@ def main() -> None:
         gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
 
         counts = extract_boxed_counts_from_output(r.get("output", {}))
+        if counts is None:
+            # If eval output is malformed/timeout, fall back to stage1 rule/judge counts for routing.
+            fallback = stage1_okbad_by_uuid.get(uuid)
+            if fallback is not None:
+                counts = (int(fallback[0]), int(fallback[1]))
 
         if counts is None:
             continue
@@ -263,15 +298,18 @@ def main() -> None:
         model_q = append_choice_map_if_any(normalize_for_model(q_raw))
         choice_map = extract_choice_map(model_q)
 
+        s2_solve_stats: Dict[str, int] = {}
         raw_outputs = llm.generate_n(
             stage_name="stage2_solve",
             question=model_q,
             prompt_mode="boxed_solve",
             sleep_s=args.sleep,
+            stats=s2_solve_stats,
         )
 
         attempts: List[Dict[str, Any]] = []
         ok2 = 0
+        s2_judge_stats: Dict[str, int] = {}
         for raw in raw_outputs[:8]:
             boxed = extract_boxed_answer(raw)
             extracted = boxed or extract_final_answer(raw)
@@ -286,6 +324,7 @@ def main() -> None:
                     pred=pred,
                     choice_map=choice_map,
                     stage="stage2",
+                    stats=s2_judge_stats,
                 )
                 judge_src = "llm" if eq is not None else "unknown"
 
@@ -318,6 +357,14 @@ def main() -> None:
                 "stage2_solve": llm.stage_params("stage2_solve").n,
                 "stage2_judge_llm_fallback": sum(1 for a in attempts if a.get("judge_source") == "llm"),
                 "stage2_judge_unknown": sum(1 for a in attempts if a.get("judge_source") == "unknown"),
+                "stage2_solve_http_calls": int(s2_solve_stats.get("http_calls", 0)),
+                "stage2_solve_retries": int(s2_solve_stats.get("retries", 0)),
+                "stage2_solve_timeouts": int(s2_solve_stats.get("timeouts", 0)),
+                "stage2_solve_errors": int(s2_solve_stats.get("errors", 0)),
+                "stage2_judge_http_calls": int(s2_judge_stats.get("http_calls", 0)),
+                "stage2_judge_retries": int(s2_judge_stats.get("retries", 0)),
+                "stage2_judge_timeouts": int(s2_judge_stats.get("timeouts", 0)),
+                "stage2_judge_errors": int(s2_judge_stats.get("errors", 0)),
             },
         }
         stage2_archive.append(entry)
@@ -328,6 +375,9 @@ def main() -> None:
         else:
             accepted_bank.append({**entry, "accepted_from": "stage2"})
 
+    # Checkpoint: persist Stage2 before running Stage3, so long Stage3 calls won't delay Stage2 visibility.
+    write_jsonl_atomic(stage2_archive_path, stage2_archive)
+
     # Stage3: repeat Stage2 logic for stage3 candidates; discard if still hard.
     for r in stage3_candidates:
         uuid = r.get("uuid")
@@ -336,15 +386,18 @@ def main() -> None:
         model_q = append_choice_map_if_any(normalize_for_model(q_raw))
         choice_map = extract_choice_map(model_q)
 
+        s3_solve_stats: Dict[str, int] = {}
         raw_outputs = llm.generate_n(
             stage_name="stage3_solve",
             question=model_q,
             prompt_mode="boxed_solve",
             sleep_s=args.sleep,
+            stats=s3_solve_stats,
         )
 
         attempts: List[Dict[str, Any]] = []
         ok3 = 0
+        s3_judge_stats: Dict[str, int] = {}
         for raw in raw_outputs[:8]:
             boxed = extract_boxed_answer(raw)
             extracted = boxed or extract_final_answer(raw)
@@ -359,6 +412,7 @@ def main() -> None:
                     pred=pred,
                     choice_map=choice_map,
                     stage="stage3",
+                    stats=s3_judge_stats,
                 )
                 judge_src = "llm" if eq is not None else "unknown"
 
@@ -391,6 +445,14 @@ def main() -> None:
                 "stage3_solve": llm.stage_params("stage3_solve").n,
                 "stage3_judge_llm_fallback": sum(1 for a in attempts if a.get("judge_source") == "llm"),
                 "stage3_judge_unknown": sum(1 for a in attempts if a.get("judge_source") == "unknown"),
+                "stage3_solve_http_calls": int(s3_solve_stats.get("http_calls", 0)),
+                "stage3_solve_retries": int(s3_solve_stats.get("retries", 0)),
+                "stage3_solve_timeouts": int(s3_solve_stats.get("timeouts", 0)),
+                "stage3_solve_errors": int(s3_solve_stats.get("errors", 0)),
+                "stage3_judge_http_calls": int(s3_judge_stats.get("http_calls", 0)),
+                "stage3_judge_retries": int(s3_judge_stats.get("retries", 0)),
+                "stage3_judge_timeouts": int(s3_judge_stats.get("timeouts", 0)),
+                "stage3_judge_errors": int(s3_judge_stats.get("errors", 0)),
             },
         }
         stage3_archive.append(entry)

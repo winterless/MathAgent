@@ -5,7 +5,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,10 @@ class LLMConfig:
     api_key: str
     model: str
     timeout_s: int = 60
+    retry_max: int = 0
+    retry_backoff_s: float = 1.0
+    retry_backoff_mult: float = 2.0
+    retry_jitter_s: float = 0.0
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "LLMConfig":
@@ -25,7 +29,20 @@ class LLMConfig:
         api_key = str(d.get("api_key") or "")
         model = str(d.get("model") or "")
         timeout_s = int(d.get("timeout_s") or 60)
-        return LLMConfig(base_url=base_url, api_key=api_key, model=model, timeout_s=timeout_s)
+        retry_max = int(d.get("retry_max") or 0)
+        retry_backoff_s = float(d.get("retry_backoff_s") or 1.0)
+        retry_backoff_mult = float(d.get("retry_backoff_mult") or 2.0)
+        retry_jitter_s = float(d.get("retry_jitter_s") or 0.0)
+        return LLMConfig(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            timeout_s=timeout_s,
+            retry_max=retry_max,
+            retry_backoff_s=retry_backoff_s,
+            retry_backoff_mult=retry_backoff_mult,
+            retry_jitter_s=retry_jitter_s,
+        )
 
 
 class LLMClient:
@@ -41,7 +58,18 @@ class LLMClient:
         if missing:
             raise RuntimeError("Missing LLM config fields: " + ", ".join(missing) + ".")
 
-    def chat_once(self, *, system: str, user: str, temperature: float = 0.2, max_tokens: int = 512) -> str:
+    def chat_once(
+        self,
+        *,
+        stage_name: str,
+        system: str,
+        user: str,
+        temperature: float = 0.2,
+        max_tokens: int = 512,
+        stats: Optional[Dict[str, int]] = None,
+        stream: bool = False,
+        stream_printer: Optional[Callable[[str], None]] = None,
+    ) -> str:
         """
         Call one completion via http (OpenAI-compatible /v1/chat/completions).
         Returns assistant content as string.
@@ -58,33 +86,102 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if stream:
+            body["stream"] = True
         data = json.dumps(body).encode("utf-8")
         headers: Dict[str, str] = {"Content-Type": "application/json"}
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
         req = urllib.request.Request(url, method="POST", data=data, headers=headers)
 
-        try:
-            with urllib.request.urlopen(req, timeout=self.config.timeout_s) as resp:
-                raw = resp.read().decode("utf-8")
-        except urllib.error.HTTPError as e:
-            err_body = ""
-            try:
-                err_body = e.read().decode("utf-8")
-            except Exception:
-                pass
-            raise RuntimeError(f"LLM HTTPError {e.code}: {err_body}") from e
-        except urllib.error.URLError as e:
-            raise RuntimeError(f"LLM URLError: {e}") from e
+        def _bump(key: str, inc: int = 1) -> None:
+            if stats is None:
+                return
+            stats[key] = int(stats.get(key, 0)) + inc
 
-        obj = json.loads(raw)
-        choices = obj.get("choices") or []
-        if not choices:
-            raise RuntimeError(f"LLM returned no choices: {raw}")
-        msg = (choices[0].get("message") or {}).get("content")
-        if not isinstance(msg, str):
-            raise RuntimeError(f"LLM returned invalid message: {raw}")
-        return msg.strip()
+        backoff = max(float(self.config.retry_backoff_s), 0.0)
+        attempts = max(int(self.config.retry_max), 0) + 1
+        last_err: Exception | None = None
+        for attempt in range(attempts):
+            _bump("http_calls", 1)
+            try:
+                with urllib.request.urlopen(req, timeout=self.config.timeout_s) as resp:
+                    if not stream:
+                        raw = resp.read().decode("utf-8")
+                        obj = json.loads(raw)
+                        choices = obj.get("choices") or []
+                        if not choices:
+                            raise RuntimeError(f"LLM returned no choices: {raw}")
+                        msg = (choices[0].get("message") or {}).get("content")
+                        if not isinstance(msg, str):
+                            raise RuntimeError(f"LLM returned invalid message: {raw}")
+                        last_err = None
+                        return msg.strip()
+
+                    # Streaming (OpenAI SSE): accumulate deltas and optionally print them.
+                    chunks: List[str] = []
+                    while True:
+                        line_b = resp.readline()
+                        if not line_b:
+                            break
+                        line = line_b.decode("utf-8", errors="ignore").strip()
+                        if not line:
+                            continue
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[len("data:") :].strip()
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            evt = json.loads(payload)
+                        except Exception:
+                            continue
+
+                        choices = evt.get("choices") or []
+                        if not choices:
+                            continue
+                        c0 = choices[0] or {}
+                        delta = c0.get("delta") or {}
+                        piece = delta.get("content")
+                        if not isinstance(piece, str):
+                            # Some servers may stream full message; try fallbacks
+                            msg = (c0.get("message") or {}).get("content")
+                            piece = msg if isinstance(msg, str) else None
+                        if isinstance(piece, str) and piece:
+                            chunks.append(piece)
+                            if stream_printer is not None:
+                                stream_printer(piece)
+                    last_err = None
+                    return "".join(chunks).strip()
+            except urllib.error.HTTPError as e:
+                # Retry only for transient server errors / throttling.
+                err_body = ""
+                try:
+                    err_body = e.read().decode("utf-8")
+                except Exception:
+                    pass
+                last_err = RuntimeError(f"LLM HTTPError {e.code}: {err_body}")
+                retriable = e.code in (429, 500, 502, 503, 504)
+                if not retriable or attempt >= attempts - 1:
+                    raise last_err from e
+            except (TimeoutError, urllib.error.URLError) as e:
+                # URLError is a wrapper for many network issues, incl timeouts.
+                last_err = RuntimeError(f"LLM network error: {e}")
+                _bump("timeouts", 1)
+                if attempt >= attempts - 1:
+                    raise last_err from e
+
+            # retry path
+            _bump("retries", 1)
+            if backoff > 0:
+                # deterministic "jitter" without random import
+                sleep_s = backoff + (float(self.config.retry_jitter_s) if attempt % 2 == 0 else 0.0)
+                time.sleep(max(sleep_s, 0.0))
+            backoff *= max(float(self.config.retry_backoff_mult), 1.0)
+
+        if last_err is not None:
+            raise RuntimeError(f"LLM failed after retries: stage={stage_name!r}") from last_err
+        raise RuntimeError(f"LLM failed unexpectedly: stage={stage_name!r}")
 
     def generate_n(
         self,
@@ -96,6 +193,14 @@ class LLMClient:
         temperature: float,
         max_tokens: int = 512,
         sleep_s: float = 0.0,
+        stats: Optional[Dict[str, int]] = None,
+        finish_early: bool = True,
+        think_tag: str = "",
+        debug_print_prompts: bool = False,
+        debug_print_prompts_max_chars: int = 4000,
+        debug_print_outputs: bool = False,
+        debug_print_outputs_max_chars: int = 2000,
+        debug_stream_outputs: bool = False,
     ) -> List[str]:
         """
         Generate n independent answers by calling chat_once n times.
@@ -169,25 +274,114 @@ class LLMClient:
                 "如果题目不是选择题：\\boxed{<答案>} 中 <答案> 为最终数值/表达式。\n"
                 "不要输出 FINAL: 格式。"
             )
+            if finish_early:
+                system += (
+                    "\n\n"
+                    "如果你感觉推理会很长、或可能来不及写完，请立刻停止推理，直接给出你认为最可能的最终答案。\n"
+                    "选择题必须在 A/B/C/D 中猜测一个字母；不要输出多余内容。"
+                )
             # User side only asks the question (per Architecture.md).
             base_user = question.strip()
         else:
             system = (
                 f"你是一个数学解题助手。Stage={stage_name}。\n"
-                "你可以输出推理过程。\n"
                 "最后一行必须输出最终答案，且格式必须严格为：FINAL: <答案>\n"
                 "如果题目是选择题：<答案> 只能是单个大写字母 A/B/C/D。\n"
                 "如果题目不是选择题：<答案> 为最终数值/表达式。"
             )
+            if finish_early:
+                system += (
+                    "\n"
+                    "如果你感觉推理会很长、或可能来不及写完，请立刻停止推理，"
+                    "直接在最后一行输出 FINAL: <你认为最可能的答案>（选择题在 A/B/C/D 中猜一个）。"
+                )
             base_user = (
                 f"题目：\n{question}\n\n"
                 "要求：你可以写推理过程，但最后一行必须是 FINAL: <答案>（严格格式）。"
             )
 
+        # Optional Qwen-style mode tag injection (/think, /no_think, etc.)
+        # By default we only inject for solve-like modes, not for eval/judge prompts.
+        tag = (think_tag or "").strip()
+        if tag and mode not in ("raw_prompt", "raw_prompt_eval"):
+            if not tag.startswith("/"):
+                tag = "/" + tag
+            base_user = f"{tag}\n{base_user}"
+
+        def _truncate(s: str) -> str:
+            m = int(debug_print_prompts_max_chars or 0)
+            if m <= 0:
+                return s
+            if len(s) <= m:
+                return s
+            return s[:m] + "\n...<truncated>..."
+
+        def _truncate_out(s: str) -> str:
+            m = int(debug_print_outputs_max_chars or 0)
+            if m <= 0:
+                return s
+            if len(s) <= m:
+                return s
+            return s[:m] + "\n...<truncated>..."
+
         for i in range(n):
             user = base_user if mode in ("raw_prompt", "raw_prompt_eval") else f"{base_user}\n采样编号={i}"
-            ans = self.chat_once(system=system, user=user, temperature=temperature, max_tokens=max_tokens)
-            answers.append(ans)
+            if debug_print_prompts:
+                header = (
+                    f"\n========== [LLM_PROMPT] stage={stage_name} mode={mode} "
+                    f"sample={i+1}/{n} model={self.config.model} base_url={self.config.base_url} "
+                    f"temperature={temperature} max_tokens={max_tokens} timeout_s={self.config.timeout_s} ==========\n"
+                )
+                print(header, flush=True)
+                print("---- SYSTEM ----", flush=True)
+                print(_truncate(system), flush=True)
+                print("---- USER ----", flush=True)
+                print(_truncate(user), flush=True)
+                print("========== [LLM_PROMPT END] ==========\n", flush=True)
+            try:
+                stream_this = bool(debug_stream_outputs and debug_print_outputs)
+                if stream_this:
+                    print(
+                        f"========== [LLM_OUTPUT_STREAM] stage={stage_name} mode={mode} sample={i+1}/{n} ==========",
+                        flush=True,
+                    )
+
+                    def _printer(piece: str) -> None:
+                        print(piece, end="", flush=True)
+
+                ans = self.chat_once(
+                    stage_name=stage_name,
+                    system=system,
+                    user=user,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stats=stats,
+                    stream=stream_this,
+                    stream_printer=_printer if stream_this else None,
+                )
+                if stream_this:
+                    print("\n========== [LLM_OUTPUT_STREAM END] ==========\n", flush=True)
+                answers.append(ans)
+                if debug_print_outputs and not stream_this:
+                    print(
+                        f"========== [LLM_OUTPUT] stage={stage_name} mode={mode} sample={i+1}/{n} ==========",
+                        flush=True,
+                    )
+                    print(_truncate_out(ans), flush=True)
+                    print("========== [LLM_OUTPUT END] ==========\n", flush=True)
+            except Exception as e:
+                if stats is not None:
+                    stats["errors"] = int(stats.get("errors", 0)) + 1
+                # Keep pipeline moving; caller can treat this as an incorrect attempt.
+                err_text = f"[LLM_ERROR stage={stage_name}]: {type(e).__name__}: {e}"
+                answers.append(err_text)
+                if debug_print_outputs:
+                    print(
+                        f"========== [LLM_OUTPUT] stage={stage_name} mode={mode} sample={i+1}/{n} (ERROR) ==========",
+                        flush=True,
+                    )
+                    print(_truncate_out(err_text), flush=True)
+                    print("========== [LLM_OUTPUT END] ==========\n", flush=True)
             if sleep_s > 0:
                 time.sleep(sleep_s)
         return answers
