@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import List
 
 # This is the prompt stored in JSON, and should match datasets/sample.jsonl style:
-# a standard header + (question + standard answer + 8 answers). No output-template here.
+# a standard header + (question + standard answer + N answers). No output-template here.
 STORED_PROMPT_HEADER = (
-    "你是一个**判断答案与标准答案一致**的专家。下面提供了一道数学推理题的标准答案和8个不同答案。基于这些内容，完成以下任务。\n\n"
+    "你是一个**判断答案与标准答案一致**的专家。下面提供了一道数学推理题的标准答案和N个不同答案。基于这些内容，完成以下任务。\n\n"
     "###\n"
     "任务：\n"
     "每个解答与标准解答对比，内容一致或相似则为解答正确，否则为解答错误\n\n"
@@ -16,7 +16,7 @@ STORED_PROMPT_HEADER = (
     "4.对比的时候无需关注答案的格式。\n"
     ".禁止解题或对题目进行推理，题目仅在大难表达形式不同（如A vs 34）时，用来确认它们是否指向同一含义。\n"
     "6.若某个解答无内容或者缺少最终答案直接判定该解答错误\n\n"
-    "罗列出解答正确和解答错误的解答编号，统计解答1至解答8的解答正确数量和解答错误数量，最终结果输出在boxed中，标注解答正确数量和解答错误数量标识，详例如下：\n"
+    "罗列出解答正确和解答错误的解答编号，统计解答1至解答N的解答正确数量和解答错误数量，最终结果输出在boxed中，标注解答正确数量和解答错误数量标识，详例如下：\n"
     "\\boxed{解答正确：5，解答错误：3}\n"
     "###\n\n"
 )
@@ -28,10 +28,12 @@ def assemble_stored_prompt(*, question: str, standard_answer: str, stage1_answer
     - Header (fixed)
     - [题目] block (question)
     - [标准解答] block (standard_answer)
-    - 8 answers blocks: [解答1..8]
+    - N answers blocks: [解答1..N]
     """
     lines: List[str] = []
     lines.append(STORED_PROMPT_HEADER.rstrip("\n"))
+    # Provide N explicitly so the evaluator prompt can be dynamic.
+    lines.append(f"[N]={len(stage1_answers)}")
     lines.append("###")
     lines.append("[题目]")
     lines.append((question or "").strip())
@@ -44,8 +46,7 @@ def assemble_stored_prompt(*, question: str, standard_answer: str, stage1_answer
     lines.append("###")
     lines.append("")
 
-    for i in range(8):
-        ans = stage1_answers[i] if i < len(stage1_answers) else ""
+    for i, ans in enumerate(stage1_answers):
         lines.append("###")
         lines.append(f"[解答{i+1}]")
         lines.append((ans or "").strip())

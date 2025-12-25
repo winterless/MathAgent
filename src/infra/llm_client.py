@@ -150,7 +150,11 @@ class LLMClient:
                         if isinstance(piece, str) and piece:
                             chunks.append(piece)
                             if stream_printer is not None:
-                                stream_printer(piece)
+                                try:
+                                    stream_printer(piece)
+                                except BrokenPipeError:
+                                    # stdout closed (e.g. piping to `head`); avoid crashing the pipeline.
+                                    stream_printer = None
                     last_err = None
                     return "".join(chunks).strip()
             except urllib.error.HTTPError as e:
@@ -207,6 +211,13 @@ class LLMClient:
         """
         answers: List[str] = []
 
+        def _safe_print(*args: Any, **kwargs: Any) -> None:
+            try:
+                print(*args, **kwargs)
+            except BrokenPipeError:
+                # stdout closed (e.g. piping to `head`); avoid crashing the pipeline.
+                return
+
         mode = (prompt_mode or "problem").strip().lower()
         if mode in ("raw_prompt", "raw_prompt_eval"):
             system = ""
@@ -214,10 +225,10 @@ class LLMClient:
                 system = (
                     "你是一个**判断答案与标准答案一致**的专家。\n"
                     "你只做一致性判断，严禁解题、严禁复算、严禁推导题目。\n"
-                    "注意：你拿到的 8 个解答已经是“抽取后的答案文本”，你只能用它们来比对。\n"
+                    "注意：你拿到的解答数量以用户输入中的 [N]=... 为准；这些解答已经是“抽取后的答案文本”，你只能用它们来比对。\n"
                     "禁止输出 <think> 或任何推理过程。\n\n"
                     "注意：用户输入末尾可能包含一行 [GOLD_STANDARD_ANSWER]=...，这是唯一可信的标准答案来源。\n"
-                    "你必须用该 gold 与 8 个解答做对比（而不是去解题）。\n"
+                    "你必须用该 gold 与 N 个解答做对比（而不是去解题）。\n"
                     "对于选择题：只允许按“选项字母是否一致”判定；\n"
                     "若某个解答给的是选项内容（如 -5、\\frac{1}{5}），必须通过题目选项映射反推它对应的字母后再比较。\n"
                     "禁止把不同选项的数值用小数误差当作“相同”（例如 A=1675/16393 与 B=1675/16390 不得因接近而判一致）。\n\n"
@@ -228,7 +239,7 @@ class LLMClient:
                     "4) 忽略格式。\n"
                     "5) 解答为空或缺少最终答案 -> 错误。\n\n"
                     "输出格式（必须严格输出，参照 sample.jsonl 的 content 样式；禁止输出 JSON/代码块/额外说明）：\n"
-                    "你必须只输出一段 Markdown 文本（不是 JSON），结构必须包含且仅包含以下内容（顺序固定）：\n"
+                    "你必须只输出一段 Markdown 文本（不是 JSON），结构必须包含且仅包含以下内容（顺序固定）。其中“解答1..解答N”按 [N]=... 的数量生成：\n"
                     "我们按照题目要求，逐条对比每个解答与**标准答案**是否一致。\n\n"
                     "---\n\n"
                     "### 题目回顾：\n"
@@ -238,25 +249,14 @@ class LLMClient:
                     "---\n\n"
                     "###解答分析（逐个对比）：\n"
                     "- **解答1**：<解答1原文> -> 与标准答案一致 ✅ 或 与标准答案不一致 ❌\n"
-                    "- **解答2**：<解答2原文> -> 与标准答案一致 ✅ 或 与标准答案不一致 ❌\n"
-                    "- **解答3**：<解答3原文> -> 与标准答案一致 ✅ 或 与标准答案不一致 ❌\n"
-                    "- **解答4**：<解答4原文> -> 与标准答案一致 ✅ 或 与标准答案不一致 ❌\n"
-                    "- **解答5**：<解答5原文> -> 与标准答案一致 ✅ 或 与标准答案不一致 ❌\n"
-                    "- **解答6**：<解答6原文> -> 与标准答案一致 ✅ 或 与标准答案不一致 ❌\n"
-                    "- **解答7**：<解答7原文> -> 与标准答案一致 ✅ 或 与标准答案不一致 ❌\n"
-                    "- **解答8**：<解答8原文> -> 与标准答案一致 ✅ 或 与标准答案不一致 ❌\n\n"
+                    "- ...（一直到解答N，必须逐条列出，不可省略）...\n\n"
                     "---\n\n"
                     "### 判断汇总：\n\n"
                     "| 编号 | 是否正确 | 理由 |\n"
                     "|------|---------|------|\n"
                     "| 解答1 | 正确 ✅/错误 ❌ | <一句理由；必要时写“B（对应 5）”这种映射> |\n"
-                    "| 解答2 | 正确 ✅/错误 ❌ | <一句理由> |\n"
-                    "| 解答3 | 正确 ✅/错误 ❌ | <一句理由> |\n"
-                    "| 解答4 | 正确 ✅/错误 ❌ | <一句理由> |\n"
-                    "| 解答5 | 正确 ✅/错误 ❌ | <一句理由> |\n"
-                    "| 解答6 | 正确 ✅/错误 ❌ | <一句理由> |\n"
-                    "| 解答7 | 正确 ✅/错误 ❌ | <一句理由> |\n"
-                    "| 解答8 | 正确 ✅/错误 ❌ | <一句理由> |\n\n"
+                    "| ... | ... | ... |\n"
+                    "| 解答N | 正确 ✅/错误 ❌ | <一句理由> |\n\n"
                     "### 统计：\n"
                     "- 解题正确数量：<列出正确编号> -> 共**x个** \n"
                     "- 解题错误数量：<列出错误编号> -> 共 **y**个\n\n"
@@ -332,22 +332,22 @@ class LLMClient:
                     f"sample={i+1}/{n} model={self.config.model} base_url={self.config.base_url} "
                     f"temperature={temperature} max_tokens={max_tokens} timeout_s={self.config.timeout_s} ==========\n"
                 )
-                print(header, flush=True)
-                print("---- SYSTEM ----", flush=True)
-                print(_truncate(system), flush=True)
-                print("---- USER ----", flush=True)
-                print(_truncate(user), flush=True)
-                print("========== [LLM_PROMPT END] ==========\n", flush=True)
+                _safe_print(header, flush=True)
+                _safe_print("---- SYSTEM ----", flush=True)
+                _safe_print(_truncate(system), flush=True)
+                _safe_print("---- USER ----", flush=True)
+                _safe_print(_truncate(user), flush=True)
+                _safe_print("========== [LLM_PROMPT END] ==========\n", flush=True)
             try:
                 stream_this = bool(debug_stream_outputs and debug_print_outputs)
                 if stream_this:
-                    print(
+                    _safe_print(
                         f"========== [LLM_OUTPUT_STREAM] stage={stage_name} mode={mode} sample={i+1}/{n} ==========",
                         flush=True,
                     )
 
                     def _printer(piece: str) -> None:
-                        print(piece, end="", flush=True)
+                        _safe_print(piece, end="", flush=True)
 
                 ans = self.chat_once(
                     stage_name=stage_name,
@@ -360,15 +360,15 @@ class LLMClient:
                     stream_printer=_printer if stream_this else None,
                 )
                 if stream_this:
-                    print("\n========== [LLM_OUTPUT_STREAM END] ==========\n", flush=True)
+                    _safe_print("\n========== [LLM_OUTPUT_STREAM END] ==========\n", flush=True)
                 answers.append(ans)
                 if debug_print_outputs and not stream_this:
-                    print(
+                    _safe_print(
                         f"========== [LLM_OUTPUT] stage={stage_name} mode={mode} sample={i+1}/{n} ==========",
                         flush=True,
                     )
-                    print(_truncate_out(ans), flush=True)
-                    print("========== [LLM_OUTPUT END] ==========\n", flush=True)
+                    _safe_print(_truncate_out(ans), flush=True)
+                    _safe_print("========== [LLM_OUTPUT END] ==========\n", flush=True)
             except Exception as e:
                 if stats is not None:
                     stats["errors"] = int(stats.get("errors", 0)) + 1
@@ -376,12 +376,12 @@ class LLMClient:
                 err_text = f"[LLM_ERROR stage={stage_name}]: {type(e).__name__}: {e}"
                 answers.append(err_text)
                 if debug_print_outputs:
-                    print(
+                    _safe_print(
                         f"========== [LLM_OUTPUT] stage={stage_name} mode={mode} sample={i+1}/{n} (ERROR) ==========",
                         flush=True,
                     )
-                    print(_truncate_out(err_text), flush=True)
-                    print("========== [LLM_OUTPUT END] ==========\n", flush=True)
+                    _safe_print(_truncate_out(err_text), flush=True)
+                    _safe_print("========== [LLM_OUTPUT END] ==========\n", flush=True)
             if sleep_s > 0:
                 time.sleep(sleep_s)
         return answers

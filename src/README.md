@@ -1,7 +1,11 @@
 # Minimal Python pipeline (stage1 + stage2 + stage3, JSONL between stages)
 
 ## Input format
-`--input` is a JSONL file. Each line must be a JSON object with at least one of:
+`--input` can be either:
+- a JSONL file, or
+- a directory containing `*.jsonl` files (each file runs independently, using filename stem as output prefix)
+
+Each line must be a JSON object with at least one of:
 
 - `prompt`: full instruction text (preferred), or
 - `question`: task text, or
@@ -23,11 +27,16 @@ Optional flags:
 - `--sleep`: seconds to sleep between LLM calls (rate limit)
 
 Outputs (all JSONL) are written under `--out`, including:
-- `example_input.stage0.jsonl` (copy of your input)
-- `stage1_raw_generations.stage1.jsonl` (important: full raw solver outputs + extracted answers + per-attempt verdicts)
-- `stage1_output.stage1.jsonl` (evaluator-style long `content`, sample.jsonl-like wrapper)
-- `stage2_archive.stage2.jsonl` (per-problem archive for Stage2: 8 attempts + ok/bad + llm_call_counts)
-- `stage3_archive.stage3.jsonl` (per-problem archive for Stage3)
-- `accepted_bank.stage_final.jsonl` (accepted problems from stage2/stage3)
-- `discarded_hard.stage_final.jsonl` (discarded problems after stage3)
+- `example_input.stage0.jsonl` (single-file mode: copy of your input)
+- `stage1/stage1_raw_generations.stage1.jsonl` (single-file mode)
+- `stage1/stage1_output.stage1.jsonl` (single-file mode)
+- `stage2/stage2_archive.stage2.jsonl` (single-file mode)
+- `stage3/stage3_archive.stage3.jsonl` (single-file mode)
+- `accepted_bank.stage_final.jsonl` / `discarded_hard.stage_final.jsonl` (single-file mode)
+
+Directory mode additionally writes these **prefixed** artifacts per input file:
+- `stage1/<prefix>.stage1_output.stage1.jsonl`, `stage1/<prefix>.stage1_raw_generations.stage1.jsonl`, `stage1/<prefix>.status.stage1.jsonl`
+- `stage2/<prefix>.stage2_archive.stage2.jsonl`, `stage2/<prefix>.status.stage2.jsonl`
+- `stage3/<prefix>.stage3_archive.stage3.jsonl`, `stage3/<prefix>.status.stage3.jsonl`
+- `<prefix>.accepted_bank.stage_final.jsonl`, `<prefix>.discarded_hard.stage_final.jsonl`
 

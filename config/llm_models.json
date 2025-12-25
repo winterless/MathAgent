@@ -33,16 +33,16 @@
   },
   "stage_params": {
     "default": { "n": 1, "temperature": 0.8, "max_tokens": 16384 },
-    "stage1_solve": { "n": 8, "temperature": 2, "max_tokens": 16384 },
+    "stage1_solve": { "n": 4, "temperature": 2, "max_tokens": 16384 },
     "stage1_eval":  { "n": 1, "temperature": 0, "max_tokens": 16384 },
     "stage1_judge": { "n": 1, "temperature": 0, "max_tokens": 16384 },
-    "stage2_solve": { "n": 8, "temperature": 2, "max_tokens": 16384 },
+    "stage2_solve": { "n": 4, "temperature": 2, "max_tokens": 16384 },
     "stage2_judge": { "n": 1, "temperature": 0, "max_tokens": 16384 },
-    "stage3_solve": { "n": 8, "temperature": 2, "max_tokens": 16384 },
+    "stage3_solve": { "n": 4, "temperature": 2, "max_tokens": 16384 },
     "stage3_judge": { "n": 1, "temperature": 0, "max_tokens": 16384 }
   },
   "thresholds": {
-    "min_ok_to_accept": 5
+    "min_votes_to_accept": 3
   },
   "options": {
     "finish_early": true,
@@ -52,16 +52,16 @@
     "debug_print_outputs_max_chars": 2000,
     "debug_stream_outputs": true,
     "think_tag_default": "",
-    "think_tag_by_stage": {
-      "stage1_solve": "/no_think",
-      "stage2_solve": "/no_think",
-      "stage3_solve": "/think"
+    "think_tag_by_profile": {
+      "base": "",
+      "think_fast": "/no_think",
+      "think_slow": "/think"
     }
   },
   "routes": {
     "default": "base",
     "stage1_solve": "think_fast",
-    "stage1_eval": "think_slow",
+    "stage1_eval": "think_fast",
     "stage1_judge": "think_fast",
     "stage2_solve": "think_fast",
     "stage2_judge": "think_fast",

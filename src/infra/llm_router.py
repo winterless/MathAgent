@@ -178,12 +178,23 @@ class LLMRouter:
         Config keys:
           - options.think_tag_default: string
           - options.think_tag_by_stage: { "<stage_name>": "<tag>" }
+          - options.think_tag_by_profile: { "<model_key>": "<tag>" }  # model_key is the routed profile, e.g. think_fast/think_slow/base
         """
         by_stage = self._options.get("think_tag_by_stage")
         if isinstance(by_stage, dict):
             v = by_stage.get((stage_name or "").strip())
             if isinstance(v, str):
                 return v
+
+        # If not overridden by stage, infer tag by routed profile (model key).
+        by_profile = self._options.get("think_tag_by_profile")
+        if isinstance(by_profile, dict):
+            key = (stage_name or "").strip()
+            model_key = self._routes.get(key) or self._routes.get("default") or ""
+            if isinstance(model_key, str) and model_key:
+                v2 = by_profile.get(model_key)
+                if isinstance(v2, str):
+                    return v2
         return self.option_str("think_tag_default", "")
 
     def _pick_client(self, stage_name: str) -> LLMClient:
