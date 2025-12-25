@@ -23,9 +23,11 @@ Optional flags:
 - `--sleep`: seconds to sleep between LLM calls (rate limit)
 
 Outputs (all JSONL) are written under `--out`, including:
-- `example_input.jsonl` (copy of your input)
-- `stage1_raw_generations.jsonl` (important: full raw solver outputs + extracted answers)
-- `stage1_output.jsonl` (evaluator-style long `content`, sample.jsonl-like)
-- `stage2_output.jsonl` (minimal: only re-evaluates rows missing boxed)
-- `stage3_output.jsonl` (minimal: only re-evaluates rows still missing boxed)
+- `example_input.stage0.jsonl` (copy of your input)
+- `stage1_raw_generations.stage1.jsonl` (important: full raw solver outputs + extracted answers + per-attempt verdicts)
+- `stage1_output.stage1.jsonl` (evaluator-style long `content`, sample.jsonl-like wrapper)
+- `stage2_archive.stage2.jsonl` (per-problem archive for Stage2: 8 attempts + ok/bad + llm_call_counts)
+- `stage3_archive.stage3.jsonl` (per-problem archive for Stage3)
+- `accepted_bank.stage_final.jsonl` (accepted problems from stage2/stage3)
+- `discarded_hard.stage_final.jsonl` (discarded problems after stage3)
 

@@ -1,73 +1,100 @@
-# MathAgent Architecture（按功能分层）
+## MathAgent Architecture
 
 ![Architecture](others/diagrams/architecture.png)
 
-### 分层目录结构（源码）
+### 源码分层（真实目录）
 
-- **CLI layer**：`src/run_pipeline.py`
-  - 唯一入口，串联 Stage1/2/3，负责读写 JSONL（内部调用 `src/core|io|infra` 模块）
-- **Core layer（Domain）**：`src/core/`
-  - `stages.py`：题目归一化、选项映射、答案抽取（支持 `FINAL:`）、boxed 统计解析
-  - `prompt_assemble.py`：拼装 `sample.jsonl` 风格的 `prompt`
-  - `voting.py`：多数投票
-- **IO layer**：`src/dataio/`
-  - `jsonl_io.py`：JSONL 读写（原子写入）
-  - `sample_schema.py`：输出 schema 对齐 `datasets/sample.jsonl`
-- **Infra layer**：`src/infra/`
-  - `llm_client.py`：OpenAI-compatible HTTP 客户端（vLLM/OpenAI 均可）
+- **CLI / Orchestration**：`src/run_pipeline.py`
+  - 唯一入口：读取输入 JSONL → Stage1 → Stage2 → Stage3 → 落盘各阶段 JSONL
+  - 统一实现了 Stage1/2/3 的 **抽取/判别/路由策略**
+- **Core (Domain)**：`src/core/`
+  - `stages.py`：归一化、选项映射、答案抽取、规则等价判别、boxed 统计解析
+  - `prompt_assemble.py`：拼装 Stage1 evaluator 的 `prompt`（sample.jsonl 风格）
+  - `voting.py`：多数投票（Stage1 的 8 次采样）
+- **IO**：`src/dataio/`
+  - `jsonl_io.py`：JSONL 读写（`write_jsonl_atomic` 原子写入）
+  - `sample_schema.py`：输出 wrapper/schema 归一（对齐 sample 风格字段）
+- **Infra (LLM)**：`src/infra/`
+  - `llm_router.py`：从 `config/llm_models.json` 读取 models/routes/stage_params/thresholds/options，并对外提供统一 API
+  - `llm_client.py`：OpenAI-compatible HTTP 客户端（支持 retry/backoff；debug 打印；支持 SSE stream 流式输出）
 
-### Pipeline（运行时数据流）
+### 配置中心：`config/llm_models.json`
 
-- **输入**：`--input <path>.jsonl`（包含 `question` 与 `answer`）
-- **Stage1 solve**：对每题采样 8 次（允许输出推理，最后一行 `FINAL: ...`），写入 `stage1_raw_generations.jsonl`
-- **Stage1 eval**：把 8 个答案拼入 `prompt`，再调用 evaluator 输出长 Markdown，写入 `stage1_output.jsonl`
-- **难度记录（最小化即可）**：从 Stage1 eval 的最后一行 `\\boxed{解答正确：x，解答错误：y}` 中解析 `x/y` 并记录难度
-  - **难度定义（建议）**：`difficulty = 解答错误数量 = y = 8 - x`
-  - **进入 Stage2 的条件**：`y >= 4`（等价于 `x <= 4`）
+- **models**：不同“模型实例”的基础参数（如 base/think_fast/think_slow，对应不同 endpoint/model/timeout/retry）
+- **routes**：`stage_name -> model_key` 的路由（例如 `stage2_solve` 走 think_fast）
+- **stage_params**：每个 stage 的采样参数（`n/temperature/max_tokens`）
+- **thresholds**
+  - `min_ok_to_accept`：**接受阈值**。在 N=8 时，`min_ok_to_accept=5` 等价于 **bad≥4 则进入下一阶段**（Stage1→2、Stage2→3、Stage3→discard）
+- **options**
+  - `finish_early`：solve 类 prompt 的“提前结束/猜答案”提示策略（软控制）
+  - `think_tag_default` / `think_tag_by_stage`：用户侧 tag 注入（例如 `/no_think`）
+  - `debug_print_prompts` / `debug_print_outputs`：打印 prompt / raw 输出
+  - `debug_stream_outputs`：当开启 debug_print_outputs 时，**对输出采用流式打印**（`stream=true`）
 
-### Stage2（难题二次推理与规则优先验算）
+### 运行时数据流（Pipeline）
 
-Stage2 仅对“难题”执行，目标是：用更强/更慢的模型做 8 次推理，**答案必须落在 `\\boxed{...}` 内**，再用“规则优先 + 必要时模型裁决”的方式判定每次推理是否正确，并把完整过程归档成题库条目。
+#### 输入
 
-- **Stage2 需要解析/携带的信息**
-  - **uuid**
-  - **difficulty**（以及 Stage1 的 `x/y` 作为来源）
-- **Stage2 路由规则**
-  - 若 `stage1_bad < 4`：跳过 Stage2，直接处理下一条
-  - 若 `stage1_bad >= 4`：进入 Stage2
-- **Stage2 推理（模型调用）**
-  - 对每个问题调用 Stage2 模型 **8 次**
-  - **提问内容**：只提供 **question**（不再拼接 Stage1 的 8 个答案/长评测 prompt）
-  - **强制输出格式**：要求模型把最终答案写入 `\\boxed{...}`（用于后续可靠抽取）
-  - 记录每次推理的 **完整原文输出**
-- **Stage2 答案抽取与判别（规则优先）**
-  - **抽取器**：从每次推理结果中提取 `\\boxed{...}` 内的答案字符串（作为候选 final）
-  - **规则系统（非大模型）优先判别是否与 gold 一致**
-    - **strip/normalize**：字符串标准化（去空格、大小写、符号归一、全角半角等）
-    - **精准匹配**：可直接判定的完全一致
-    - **简单等价性**：处理常见等价（如 `A` vs `A`
-      / `A.-5` vs `-5` 的选项映射、分数/小数互化等）
-    - **数学表达式验证**：对表达式做解析与等价判断（使用专业数学库；数值比较可设容差）
-  - **规则无法判别的样本**：再交给大模型做“答案一致性判定”（只裁决，不解题）
-- **Stage2 归档（按问题聚合）**
-  - 对每个问题，把 8 次推理的完整信息与判别结果存为列表（用于后续训练/分析）
-  - 归档条目建议包含：`uuid`、`difficulty(x/y)`、`question`、`gold_answer`、`attempts[]`
-    - `attempts[]`：每次推理的 `raw_text`、`boxed_answer`、`verdict(正确/错误/不确定->已裁决)`、`judge_reason(可选)`
-- **Stage2 产出与 Stage3 判定**
-  - 在“规则优先 + 模型裁决”后得到该题的总体判别结果（统计 `stage2_ok/stage2_bad`）
-  - 若 `stage2_bad >= 4`：进入 Stage3
-  - 否则：将该题的归档结果写入题库目录（问题、推理结果列表、答案、uuid、难度）
+- `--input <path>.jsonl`
+  - 每行至少包含 `question` 和 `answer`（`normalize_record()` 会兼容 `prompt/text` 等字段）
 
-### Stage3（复用 Stage2 的判别/归档逻辑；难题仍可放弃）
+#### Stage0（输入副本）
 
-- **进入条件**：Stage2 后 `stage2_bad >= 4`
-- **执行内容**：重复 Stage2 的
-  - 抽取器（boxed）
-  - 规则系统优先判别 + 不确定样本的模型裁决
-  - 8 次推理完整信息 + 标签列表归档
-- **结束条件**
-  - 若 Stage3 后 `stage3_bad >= 4`：**放弃该题**（不进入题库）
-  - 否则：同样归档到题库目录
+- 输出：`example_input.stage0.jsonl`（输入文件 copy）
+
+#### Stage1：solve(8) + judge(规则优先) + eval(长评测)
+
+- **solve**（`stage1_solve` / `prompt_mode="problem"`）
+  - 对每题采样 `n=8` 次，保存原始输出
+- **抽取器（Stage1/2/3 共用）**
+  - 优先 `extract_boxed_answer(raw)`，否则 `extract_final_answer(raw)`
+  - 再对 MCQ 做 `standardize_choice_answer(...)`
+- **判别器（Stage1/2/3 共用）**
+  - 先 `rule_equivalent(pred, gold, choice_map=...) -> True/False/None`
+  - 仅当规则返回 `None` 时，才调用 LLM 兜底裁决（`*_judge`，只允许输出：一致/不一致/不确定）
+- **eval**（`stage1_eval` / `prompt_mode="raw_prompt_eval"`）
+  - 只做“对比与统计”，输出长 Markdown；若缺失 boxed 统计，会最多重试 1 次
+- Stage1 产物
+  - `stage1_raw_generations.stage1.jsonl`：每题的 8 次 raw + 抽取结果 + attempts verdict + `llm_call_counts`
+  - `stage1_output.stage1.jsonl`：sample 风格 wrapper（包含 evaluator 的长 `content`）
+
+#### Stage2：只处理“难题”，boxed_solve + 规则判别 + 归档（带 checkpoint）
+
+- **进入条件（来自 Stage1）**
+  - 使用 Stage1 eval 的 boxed 统计（或 fallback 到 Stage1 judge 得到的 ok/bad）
+  - `ok < min_ok_to_accept` 则进入 Stage2
+- **solve**（`stage2_solve` / `prompt_mode="boxed_solve"`）
+  - 只给 question（含选项映射），强制最终答案进 `\\boxed{...}`
+- **判别/归档**
+  - 同 Stage1 的抽取 + 规则优先 + LLM 兜底
+  - 产出 `stage2_archive.stage2.jsonl`（每题聚合 attempts、ok/bad、llm_call_counts）
+- **checkpoint**
+  - Stage2 全部跑完后，会先写一次 `stage2_archive.stage2.jsonl`，再进入 Stage3（避免 Stage3 很慢导致 Stage2 文件迟迟不可见）
+
+#### Stage3：复用 Stage2 逻辑，仍不通过则丢弃
+
+- **进入条件**：Stage2 后 `ok < min_ok_to_accept`
+- **执行内容**：同 Stage2（boxed_solve + 抽取判别 + 归档）
+- **结束**
+  - 通过：写入 `accepted_bank.stage_final.jsonl`
+  - 不通过：写入 `discarded_hard.stage_final.jsonl`
+
+### 走读代码路线（建议顺序）
+
+1. **入口与文件落盘**：`src/run_pipeline.py`
+   - `main()`：输出文件名、Stage1→Stage2→Stage3 主循环、路由阈值（`min_ok_to_accept`）
+   - `_llm_judge_equivalence()`：LLM 裁决的严格解析
+2. **抽取与规则判别**：`src/core/stages.py`
+   - `extract_boxed_answer()` / `extract_final_answer()`：最终答案抽取优先级
+   - `rule_equivalent()`：规则优先判别（MCQ 直接决策，无法决策才返回 None）
+   - `extract_boxed_counts*()`：Stage1 eval 的 ok/bad 统计解析
+3. **Stage1 evaluator prompt**：`src/core/prompt_assemble.py`
+   - `assemble_stored_prompt(...)`：把 8 个答案拼成 evaluator 输入
+4. **LLM 配置/路由/参数注入**：`src/infra/llm_router.py`
+   - `stage_params()` / `threshold_int()` / `option_bool()` / `think_tag_for_stage()`
+5. **LLM 调用与 debug**：`src/infra/llm_client.py`
+   - `generate_n()`：按 mode 组装 prompt、debug 打印、可选 streaming 输出
+   - `chat_once()`：HTTP 调用 + retry/backoff；`stream=true` 的 SSE 解析
 
 
 
