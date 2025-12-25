@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -11,12 +13,20 @@ from typing import Any, Callable, Dict, List, Optional
 @dataclass(frozen=True)
 class LLMConfig:
     """
-    Minimal OpenAI-compatible config (HTTP only).
+    Minimal OpenAI-compatible config.
+    Supports either:
+    - HTTP (/v1/chat/completions), or
+    - a local python script runner (py_script) that implements a small stdin/stdout contract
     """
 
     base_url: str
     api_key: str
     model: str
+    # Optional: if set, use a local python script instead of HTTP.
+    # The pipeline will execute: `<python_bin> <py_script>` and pass a JSON request via stdin.
+    py_script: str = ""
+    # Optional: python executable used to run py_script (defaults to current python).
+    python_bin: str = ""
     timeout_s: int = 60
     retry_max: int = 0
     retry_backoff_s: float = 1.0
@@ -28,6 +38,8 @@ class LLMConfig:
         base_url = str(d.get("base_url") or "")
         api_key = str(d.get("api_key") or "")
         model = str(d.get("model") or "")
+        py_script = str(d.get("py_script") or "")
+        python_bin = str(d.get("python_bin") or "")
         timeout_s = int(d.get("timeout_s") or 60)
         retry_max = int(d.get("retry_max") or 0)
         retry_backoff_s = float(d.get("retry_backoff_s") or 1.0)
@@ -37,6 +49,8 @@ class LLMConfig:
             base_url=base_url,
             api_key=api_key,
             model=model,
+            py_script=py_script,
+            python_bin=python_bin,
             timeout_s=timeout_s,
             retry_max=retry_max,
             retry_backoff_s=retry_backoff_s,
@@ -49,6 +63,9 @@ class LLMClient:
     def __init__(self, *, config: LLMConfig) -> None:
         self.config = config
 
+    def _has_py_script(self) -> bool:
+        return bool((self.config.py_script or "").strip())
+
     def _ensure_http_config(self) -> None:
         missing = []
         if not self.config.base_url:
@@ -57,6 +74,102 @@ class LLMClient:
             missing.append("model")
         if missing:
             raise RuntimeError("Missing LLM config fields: " + ", ".join(missing) + ".")
+
+    def _ensure_py_script_config(self) -> None:
+        p = (self.config.py_script or "").strip()
+        if not p:
+            raise RuntimeError("Missing LLM config field: py_script.")
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"py_script not found: {p}")
+        if not os.path.isfile(p):
+            raise ValueError(f"py_script is not a file: {p}")
+
+    def _parse_script_response(self, raw: str) -> str:
+        """
+        Accept either:
+        - plain text (treated as assistant content), or
+        - JSON object with OpenAI-like shape: { "choices": [ { "message": { "content": "..." } } ] }
+        - JSON object with "content": "..."
+        """
+        s = (raw or "").strip()
+        if not s:
+            return ""
+        try:
+            obj = json.loads(s)
+        except Exception:
+            return s
+        if isinstance(obj, dict):
+            if isinstance(obj.get("content"), str):
+                return str(obj.get("content") or "").strip()
+            if isinstance(obj.get("text"), str):
+                return str(obj.get("text") or "").strip()
+            choices = obj.get("choices")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                msg = choices[0].get("message")
+                if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                    return str(msg.get("content") or "").strip()
+        return s
+
+    def _script_once(
+        self,
+        *,
+        stage_name: str,
+        system: str,
+        user: str,
+        temperature: float,
+        max_tokens: int,
+        stats: Optional[Dict[str, int]] = None,
+    ) -> str:
+        """
+        Run `<python_bin> <py_script>` with a JSON request on stdin.
+        The script writes assistant content (or JSON response) to stdout.
+        """
+        self._ensure_py_script_config()
+
+        def _bump(key: str, inc: int = 1) -> None:
+            if stats is None:
+                return
+            stats[key] = int(stats.get(key, 0)) + inc
+
+        py = (self.config.python_bin or "").strip() or "python3"
+        script = (self.config.py_script or "").strip()
+        req_obj: Dict[str, Any] = {
+            "stage_name": stage_name,
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        payload = (json.dumps(req_obj, ensure_ascii=False) + "\n").encode("utf-8")
+
+        _bump("script_calls", 1)
+        try:
+            cp = subprocess.run(
+                [py, script],
+                input=payload,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=int(self.config.timeout_s or 60),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as e:
+            _bump("timeouts", 1)
+            raise RuntimeError(f"LLM py_script timeout: {e}") from e
+        except Exception as e:
+            _bump("errors", 1)
+            raise RuntimeError(f"LLM py_script failed to start: {e}") from e
+
+        out = (cp.stdout or b"").decode("utf-8", errors="ignore")
+        err = (cp.stderr or b"").decode("utf-8", errors="ignore")
+        if cp.returncode != 0:
+            _bump("errors", 1)
+            msg = err.strip() or out.strip() or f"exit_code={cp.returncode}"
+            raise RuntimeError(f"LLM py_script non-zero exit ({cp.returncode}): {msg}")
+        return self._parse_script_response(out)
 
     def chat_once(
         self,
@@ -71,9 +184,40 @@ class LLMClient:
         stream_printer: Optional[Callable[[str], None]] = None,
     ) -> str:
         """
-        Call one completion via http (OpenAI-compatible /v1/chat/completions).
+        Call one completion via:
+        - py_script (if configured), else
+        - http (OpenAI-compatible /v1/chat/completions).
         Returns assistant content as string.
         """
+        if self._has_py_script():
+            # py_script backend does not support streaming; silently degrade to non-stream.
+            stream = False
+            # Use the same retry/backoff knobs as HTTP.
+            backoff = max(float(self.config.retry_backoff_s), 0.0)
+            attempts = max(int(self.config.retry_max), 0) + 1
+            last_err: Exception | None = None
+            for attempt in range(attempts):
+                try:
+                    return self._script_once(
+                        stage_name=stage_name,
+                        system=system,
+                        user=user,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        stats=stats,
+                    ).strip()
+                except Exception as e:
+                    last_err = e
+                    if stats is not None:
+                        stats["retries"] = int(stats.get("retries", 0)) + (1 if attempt < attempts - 1 else 0)
+                    if attempt >= attempts - 1:
+                        raise RuntimeError(f"LLM failed after retries: stage={stage_name!r}") from last_err
+                    if backoff > 0:
+                        sleep_s = backoff + (float(self.config.retry_jitter_s) if attempt % 2 == 0 else 0.0)
+                        time.sleep(max(sleep_s, 0.0))
+                    backoff *= max(float(self.config.retry_backoff_mult), 1.0)
+            raise RuntimeError(f"LLM failed unexpectedly: stage={stage_name!r}")
+
         self._ensure_http_config()
 
         url = self.config.base_url.rstrip("/") + "/v1/chat/completions"

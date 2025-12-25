@@ -1,5 +1,22 @@
 {
+  "__comment__": [
+    "NOTE: This file must be valid JSON (no // or /* */ comments).",
+    "Below is an example of the optional py_script backend. It is NOT used unless you route a stage to it in `routes`.",
+    "Example: set `routes.stage1_solve` to `local_script_example` to enable.",
+    "If you use py_script, it's recommended to disable `options.debug_stream_outputs` (streaming is not supported by the script runner)."
+  ],
   "models": {
+    "local_script_example": {
+      "__comment__": "Example: run inference by executing a local python script instead of HTTP. Replace py_script with an absolute path.",
+      "py_script": "/abs/path/to/your_runner.py",
+      "python_bin": "python3",
+      "model": "any_name_for_logging",
+      "timeout_s": 300,
+      "retry_max": 1,
+      "retry_backoff_s": 1.0,
+      "retry_backoff_mult": 2.0,
+      "retry_jitter_s": 0.2
+    },
     "base": {
       "base_url": "http://127.0.0.1:8000",
       "api_key": "",

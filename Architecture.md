@@ -32,6 +32,65 @@
   - `debug_print_prompts` / `debug_print_outputs`：打印 prompt / raw 输出
   - `debug_stream_outputs`：当开启 debug_print_outputs 时，**对输出采用流式打印**（`stream=true`）
 
+### 本地 Python 推理脚本调用协议（stdin/stdout，必须遵守）
+
+当底层推理选择使用“本地 Python 脚本 runner”时，调用方会通过子进程执行：
+
+- `<python_bin> <py_script>`
+  - `python_bin`：可选，默认 `python3`
+  - `py_script`：一个可执行的 `.py` 脚本路径（建议绝对路径）
+
+并通过 **stdin/stdout** 与脚本通信（一次调用对应一次请求；需要采样 N 次时会调用 N 次）。
+
+#### 脚本输入（stdin，UTF-8 JSON）
+
+脚本必须从 stdin 读入一个 JSON 对象（stdin 会在写入完请求后关闭；脚本可按 EOF 结束读取）。
+请求字段如下（脚本应做到“向前兼容”：允许出现额外字段并忽略它们）：
+
+- `stage_name`：字符串，例如 `"stage1_solve"` / `"stage2_solve"` / `"stage1_eval"` 等（用于区分不同 stage 的系统提示与任务语义）
+- `model`：字符串（仅用于标识/日志；脚本可忽略）
+- `messages`：数组（OpenAI Chat Messages 结构；**prompt 就在这里**）
+  - 典型为：`[{ "role": "system", "content": "..." }, { "role": "user", "content": "..." }]`
+- `temperature`：数字
+- `max_tokens`：整数
+- `stream`：布尔（当前恒为 `false`；脚本无需实现流式输出）
+
+脚本**必须**在合理时间内输出结果并退出（超时会被中断并被视为失败；可触发重试）。
+
+一个最小可用的请求样例（仅示意字段含义）：
+
+```json
+{
+  "stage_name": "stage2_solve",
+  "model": "any_name_for_logging",
+  "messages": [
+    {"role": "system", "content": "你是一个数学解题助手..."},
+    {"role": "user", "content": "题目：..."}
+  ],
+  "temperature": 0.7,
+  "max_tokens": 2048,
+  "stream": false
+}
+```
+
+#### 脚本输出（stdout，UTF-8）
+
+脚本 stdout 必须输出“模型最终文本内容”（建议 stdout **只输出结果本身**；所有调试日志请写到 stderr）。
+支持两种等价格式（二选一）：
+
+1) **纯文本**：stdout 直接输出 assistant 的 content（任意文本）。
+
+2) **JSON**：stdout 输出一个 JSON 对象，至少满足以下其一：
+   - OpenAI-like：`{"choices":[{"message":{"content":"..."}}]}`
+   - 或简化形式：`{"content":"..."}`
+
+stderr 可用于打印调试信息。
+
+#### 成功/失败语义（调用方如何判断）
+
+- **成功**：进程退出码为 `0`，且 stdout 能解析出最终文本内容（纯文本或 JSON 皆可）。
+- **失败**：退出码非 `0` 或发生超时/异常；调用方会把它当作一次失败（可触发 retry/backoff）。
+
 ### 运行时数据流（Pipeline）
 
 #### 输入
@@ -98,7 +157,7 @@
   - 若 `majority_count < min_votes_to_accept`：认为“无法 voting 出结果”，最终答案 **fallback 到输入的 `answer`**
   - 最终都会写入 `accepted_bank.stage_final.jsonl`（`accepted_from` 会标记 `stage3` 或 `stage3_gold_fallback`）
   - 目录模式：写入 `<prefix>.accepted_bank.stage_final.jsonl`
-  - 备注：`discarded_hard.stage_final.jsonl` 属于 legacy 命名，目前代码保留路径但不会再写入（Stage3 改为 gold fallback 兜底）
+  - 备注：不再产出 `discarded_hard.stage_final.jsonl`（Stage3 改为 gold fallback 兜底）
   - 断点续传：`<prefix>.status.stage3.jsonl`
   - 文件位置：Stage3 的 archive/status 位于 `--out/stage3/` 下；final bank 位于 `--out/` 根目录
 

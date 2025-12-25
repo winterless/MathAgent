@@ -23,6 +23,7 @@ class LLMRouterConfig:
     {
       "models": {
         "base": {"base_url": "...", "api_key": "", "model": "...", "timeout_s": 60},
+        "local_script": {"py_script": "/abs/path/to/runner.py", "model": "optional_name", "timeout_s": 300},
         "think_fast": {...},
         "think_slow": {...}
       },
@@ -113,8 +114,15 @@ class LLMRouter:
         self._clients: Dict[str, LLMClient] = {}
 
         for name, llm_cfg in cfg.models.items():
+            # A model can be backed either by HTTP (base_url+model) or by a local python script (py_script).
+            if (llm_cfg.py_script or "").strip():
+                # model name is optional for py_script runner; keep it for logging / downstream usage.
+                self._clients[name] = LLMClient(config=llm_cfg)
+                continue
             if not llm_cfg.base_url or not llm_cfg.model:
-                raise ValueError(f"Invalid llm config: models.{name} must set base_url and model")
+                raise ValueError(
+                    f"Invalid llm config: models.{name} must set either (base_url and model) or py_script"
+                )
             self._clients[name] = LLMClient(config=llm_cfg)
 
         default_name = self._routes.get("default")
