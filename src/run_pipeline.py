@@ -763,6 +763,7 @@ def _run_one_input(
             sleep_s=sleep_s,
             stats=s3_solve_stats,
         )
+        n3 = int(llm.stage_params("stage3_solve").n)
         extracted = [extract_final_answer(x) for x in raw_solutions]
         standardized = [standardize_choice_answer(a, choice_map=choice_map) for a in extracted]
 
