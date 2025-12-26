@@ -26,17 +26,12 @@ python src/run_pipeline.py --input datasets/example_input.jsonl --out datasets/o
 Optional flags:
 - `--sleep`: seconds to sleep between LLM calls (rate limit)
 
-Outputs (all JSONL) are written under `--out`, including:
-- `example_input.stage0.jsonl` (single-file mode: copy of your input)
-- `stage1/stage1_raw_generations.stage1.jsonl` (single-file mode)
-- `stage1/stage1_output.stage1.jsonl` (single-file mode)
-- `stage2/stage2_archive.stage2.jsonl` (single-file mode)
-- `stage3/stage3_archive.stage3.jsonl` (single-file mode)
-- `accepted_bank.stage_final.jsonl` (single-file mode)
+Outputs (all JSONL) are written under `--out`.
 
-Directory mode additionally writes these **prefixed** artifacts per input file:
+Per input file, artifacts are always **prefixed by the input filename stem**:
 - `stage1/<prefix>.stage1_output.stage1.jsonl`, `stage1/<prefix>.stage1_raw_generations.stage1.jsonl`, `stage1/<prefix>.status.stage1.jsonl`
 - `stage2/<prefix>.stage2_archive.stage2.jsonl`, `stage2/<prefix>.status.stage2.jsonl`
 - `stage3/<prefix>.stage3_archive.stage3.jsonl`, `stage3/<prefix>.status.stage3.jsonl`
+- `<prefix>.stage0.jsonl` (copy of your input, for traceability)
 - `<prefix>.accepted_bank.stage_final.jsonl`
 

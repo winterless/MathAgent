@@ -10,6 +10,7 @@ import argparse
 import os
 import shutil
 import time
+import re
 from typing import Any, Dict, List
 
 from core.prompt_assemble import assemble_stored_prompt
@@ -71,7 +72,11 @@ def _iter_input_jsonl_paths(input_arg: str) -> List[str]:
 def _input_prefix(path: str) -> str:
     base = os.path.basename(path)
     stem, _ext = os.path.splitext(base)
-    return stem or "input"
+    s = (stem or "input").strip()
+    # Make prefix filesystem-friendly: keep letters/numbers/._-; replace others with '_'
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+    s = s.strip("._-")
+    return s or "input"
 
 
 def _iter_stage1_output_paths(stage1_dir: str) -> List[str]:
@@ -350,11 +355,28 @@ def _run_one_input(
 
     # If we start from stage2 but there is no stage1 status file, treat everything as stage2 candidates.
     if start_stage == "stage2" and not stage1_done:
+        regenerated_status_rows: List[Dict[str, Any]] = []
         for r in normalized:
             u = r.get("uuid")
             if u is None:
                 continue
-            stage1_done[str(u)] = {"uuid": u, "ok": 0, "bad": 0, "next_stage": "stage2"}
+            row = {
+                "uuid": u,
+                "stage": "stage1",
+                "ok": 0,
+                "bad": 0,
+                "min_votes_to_accept": int(min_votes_to_accept),
+                "next_stage": "stage2",
+                "paths": {"output": input_path},
+            }
+            stage1_done[str(u)] = row
+            regenerated_status_rows.append(row)
+        # Best-effort: regenerate a minimal stage1 status file so resume/routing works even when only stage1_output exists.
+        try:
+            if regenerated_status_rows and (not os.path.exists(stage1_status_path) or os.path.getsize(stage1_status_path) <= 0):
+                write_jsonl_atomic(stage1_status_path, regenerated_status_rows)
+        except Exception:
+            pass
 
     # ---- Stage 1: per-uuid checkpointing (append) ----
     if start_stage == "stage1":
@@ -973,10 +995,10 @@ def main() -> None:
         return
 
     # Single-file mode: run through the unified implementation.
-    # Use empty prefix to keep historical filenames (no '<prefix>.' prefix).
+    # Use input filename stem as output prefix (same convention as directory mode).
     _run_one_input(
         input_path=args.input,
-        prefix="",
+        prefix=_input_prefix(args.input),
         out_dir=args.out,
         stage1_dir=stage1_dir,
         stage2_dir=stage2_dir,
