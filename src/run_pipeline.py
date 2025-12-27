@@ -606,8 +606,8 @@ def _run_one_input(
                     "paths": {"raw_generations": stage1_raw_generations_path, "output": stage1_output_path},
                 },
             )
-            if next_stage == "accepted":
-                append_jsonl_line(accepted_bank_path, {**stage1_raw_entry, **sel1, "accepted_from": "stage1"})
+            # NOTE: By design we do NOT put Stage1-accepted samples into `accepted_bank`.
+            # Rationale: Stage1-accepted cases are considered "too easy" and we keep them only in stage1 artifacts.
             stage1_done[uuid_key] = {"uuid": uuid, "ok": int(route_ok), "bad": int(route_bad), "next_stage": next_stage}
 
     # ---- Stage 2/3 ----
@@ -616,7 +616,7 @@ def _run_one_input(
     #   - Stage1 status routing decisions (status.stage1.jsonl), which may be produced externally.
     input_row_by_uuid: Dict[str, Dict[str, Any]] = {str(r.get("uuid")): r for r in normalized if r.get("uuid") is not None}
 
-    # Ensure stage1-accepted UUIDs are present in accepted_bank, even when resuming or when start_stage="stage2".
+    # Track already-accepted UUIDs in accepted_bank (Stage2/Stage3 only; Stage1 accepted is intentionally excluded).
     accepted_done: set[str] = set()
     if os.path.exists(accepted_bank_path):
         for row in iter_jsonl(accepted_bank_path, tolerate_errors=True):
@@ -642,30 +642,7 @@ def _run_one_input(
             final_answer = str(row.get("final_answer") or "").strip()
             append_jsonl_line(result_path, _to_result_entry(stage=stage, final_answer=final_answer, entry=row))
             result_done.add(u_str)
-    raw_stage1_by_uuid: Dict[str, Dict[str, Any]] = {}
-    if os.path.exists(stage1_raw_generations_path):
-        for row in iter_jsonl(stage1_raw_generations_path, tolerate_errors=True):
-            u = row.get("uuid")
-            if u is not None:
-                raw_stage1_by_uuid[str(u)] = row
-    for u_str, st in stage1_done.items():
-        if (st.get("next_stage") or "") != "accepted":
-            continue
-        if u_str in accepted_done:
-            continue
-        base = input_row_by_uuid.get(u_str, {})
-        entry = raw_stage1_by_uuid.get(u_str, {"uuid": st.get("uuid"), "stage": "stage1"})
-        entry = {
-            **entry,
-            "question": entry.get("question") or base.get("question"),
-            "gold": entry.get("gold") or base.get("answer"),
-            "final_answer": st.get("final_answer"),
-            "final_source": st.get("final_source"),
-            "final_vote_count": st.get("final_vote_count"),
-            "accepted_from": "stage1_replay",
-        }
-        append_jsonl_line(accepted_bank_path, entry)
-        accepted_done.add(u_str)
+    # IMPORTANT: Do NOT backfill Stage1-accepted UUIDs into accepted_bank.
 
     hard_rows: List[Dict[str, Any]] = []
     for u_str, st in stage1_done.items():
