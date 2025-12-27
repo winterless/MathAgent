@@ -354,8 +354,13 @@ def _run_one_input(
     input_rows = _read_all(input_path)
     normalized = [normalize_record(r) for r in input_rows]
 
-    # If we start from stage2 but there is no stage1 status file, treat everything as stage2 candidates.
-    if start_stage == "stage2" and not stage1_done:
+    # Stage1-dir input mode: when starting from stage2 and the "input" is a stage1_output file,
+    # always regenerate Stage1 status from the provided stage1_output content (eval boxed counts)
+    # and stage1_raw_generations (vote majority) if present.
+    #
+    # This is important because users may provide only `stage1_output.stage1.jsonl`, and we still
+    # need correct `status.stage1.jsonl` + routing decisions for Stage2.
+    if start_stage == "stage2" and str(os.path.basename(input_path)).endswith("stage1_output.stage1.jsonl"):
         # Regenerate Stage1 status from existing Stage1 artifacts.
         #
         # In `--stage1` mode we pass `stage1_output.stage1.jsonl` as input and start from Stage2.
@@ -430,9 +435,9 @@ def _run_one_input(
             stage1_done[u_str] = row
             regenerated_status_rows.append(row)
 
-        # Best-effort: regenerate stage1 status file so resume/routing works when only stage1_output exists.
+        # Best-effort: always write/overwrite stage1 status file in this mode so routing is correct.
         try:
-            if regenerated_status_rows and (not os.path.exists(stage1_status_path) or os.path.getsize(stage1_status_path) <= 0):
+            if regenerated_status_rows:
                 write_jsonl_atomic(stage1_status_path, regenerated_status_rows)
         except Exception:
             pass

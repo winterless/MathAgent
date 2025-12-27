@@ -17,8 +17,11 @@ _CHOICE_MAP_LINE_RE = re.compile(r"(?m)^\s*([ABCD])\s*=\s*(.+?)\s*$")
 _CHOICE_PREFIX_RE = re.compile(r"^\s*([ABCD])\s*[\.．、=:]\s*(.+?)\s*$", re.IGNORECASE)
 _CHOICE_ONLY_RE = re.compile(r"^\s*([ABCD])\s*$", re.IGNORECASE)
 
+# Note: in some JSONL artifacts, the evaluation content may be double-escaped and contain
+# '\\\\boxed{...}' (two backslash characters) instead of '\boxed{...}' (one backslash character).
+# Also tolerate both ':' and '：' in the Chinese label.
 _BOXED_RE = re.compile(
-    r"\\boxed\s*\{\s*解答正确\s*：\s*(?P<ok>\d+)\s*[，,]\s*解答错误\s*：\s*(?P<bad>\d+)\s*\}",
+    r"\\+boxed\s*\{\s*解答正确\s*[:：]\s*(?P<ok>\d+)\s*[，,]\s*解答错误\s*[:：]\s*(?P<bad>\d+)\s*\}",
     re.MULTILINE,
 )
 
