@@ -17,6 +17,7 @@ from core.prompt_assemble import assemble_stored_prompt
 from core.stages import (
     append_choice_map_if_any,
     extract_boxed_counts,
+    extract_boxed_counts_from_output,
     extract_boxed_answer,
     extract_choice_map,
     extract_final_answer,
@@ -355,23 +356,81 @@ def _run_one_input(
 
     # If we start from stage2 but there is no stage1 status file, treat everything as stage2 candidates.
     if start_stage == "stage2" and not stage1_done:
+        # Regenerate Stage1 status from existing Stage1 artifacts.
+        #
+        # In `--stage1` mode we pass `stage1_output.stage1.jsonl` as input and start from Stage2.
+        # For routing (accepted vs stage2), and for producing `status.stage1.jsonl`, we should parse:
+        # - eval boxed counts from stage1_output.output (\\boxed{解答正确：x，解答错误：y})
+        # - vote_majority + vote_majority_count from stage1_raw_generations if present
+        raw_stage1_by_uuid: Dict[str, Dict[str, Any]] = {}
+        if os.path.exists(stage1_raw_generations_path):
+            for row in iter_jsonl(stage1_raw_generations_path, tolerate_errors=True):
+                u = row.get("uuid")
+                if u is not None and isinstance(row, dict):
+                    raw_stage1_by_uuid[str(u)] = row
+
         regenerated_status_rows: List[Dict[str, Any]] = []
         for r in normalized:
             u = r.get("uuid")
             if u is None:
                 continue
+            u_str = str(u)
+
+            gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
+            counts = extract_boxed_counts_from_output(r.get("output"))
+            eval_ok = int(counts[0]) if counts is not None else None
+            eval_bad = int(counts[1]) if counts is not None else None
+
+            raw_stage1 = raw_stage1_by_uuid.get(u_str, {})
+            maj = raw_stage1.get("majority_answer") if isinstance(raw_stage1.get("majority_answer"), dict) else {}
+            vote_majority = maj.get("majority")
+            vote_majority_count = int(maj.get("majority_count", 0) or 0) if isinstance(maj, dict) else 0
+
+            # Derive judge_ok/bad from stage1_raw_generations if present.
+            judge_ok = raw_stage1.get("ok")
+            judge_bad = raw_stage1.get("bad")
+            judge_ok_i = int(judge_ok) if isinstance(judge_ok, int) else (int(judge_ok) if str(judge_ok).isdigit() else 0)
+            judge_bad_i = int(judge_bad) if isinstance(judge_bad, int) else (int(judge_bad) if str(judge_bad).isdigit() else 0)
+
+            # Routing policy:
+            # - Prefer vote consensus when available (same as normal Stage1).
+            # - Otherwise fall back to eval boxed counts: accept only if eval_bad == 0 and eval_ok > 0.
+            if vote_majority_count > 0:
+                next_stage = "accepted" if vote_majority_count >= int(min_votes_to_accept) else "stage2"
+            elif counts is not None:
+                next_stage = "accepted" if (int(counts[1]) == 0 and int(counts[0]) > 0) else "stage2"
+            else:
+                next_stage = "stage2"
+
+            # For ok/bad (difficulty), prefer eval boxed counts; else fall back to judge counts; else zeros.
+            ok_for_route = int(eval_ok) if eval_ok is not None else int(judge_ok_i)
+            bad_for_route = int(eval_bad) if eval_bad is not None else int(judge_bad_i)
+
+            sel1 = _select_answer(
+                gold=gold,
+                majority={"majority": vote_majority, "majority_count": vote_majority_count, "counts": (maj.get("counts") if isinstance(maj, dict) else {})},
+            )
+
             row = {
                 "uuid": u,
                 "stage": "stage1",
-                "ok": 0,
-                "bad": 0,
+                "ok": int(ok_for_route),
+                "bad": int(bad_for_route),
+                "eval_ok": eval_ok,
+                "eval_bad": eval_bad,
+                "judge_ok": int(judge_ok_i),
+                "judge_bad": int(judge_bad_i),
                 "min_votes_to_accept": int(min_votes_to_accept),
-                "next_stage": "stage2",
-                "paths": {"output": input_path},
+                "vote_majority": vote_majority,
+                "vote_majority_count": int(vote_majority_count),
+                **sel1,
+                "next_stage": next_stage,
+                "paths": {"raw_generations": stage1_raw_generations_path, "output": input_path},
             }
-            stage1_done[str(u)] = row
+            stage1_done[u_str] = row
             regenerated_status_rows.append(row)
-        # Best-effort: regenerate a minimal stage1 status file so resume/routing works even when only stage1_output exists.
+
+        # Best-effort: regenerate stage1 status file so resume/routing works when only stage1_output exists.
         try:
             if regenerated_status_rows and (not os.path.exists(stage1_status_path) or os.path.getsize(stage1_status_path) <= 0):
                 write_jsonl_atomic(stage1_status_path, regenerated_status_rows)
