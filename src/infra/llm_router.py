@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -45,8 +46,24 @@ class LLMRouterConfig:
 
     @staticmethod
     def load(path: str) -> "LLMRouterConfig":
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
+        # Be robust to occasional non-UTF8 bytes in config files.
+        # This prevents crashes like:
+        #   'utf-8' codec can't decode byte ...: invalid continuation byte
+        with open(path, "rb") as f:
+            b = f.read()
+        try:
+            s = b.decode("utf-8")
+        except UnicodeDecodeError as e:
+            s = b.decode("utf-8", errors="replace")
+            print(
+                f"[WARN] Non-UTF8 bytes in LLM config {path}: {e}. Decoded with replacement.",
+                file=sys.stderr,
+                flush=True,
+            )
+        # tolerate UTF-8 BOM
+        if s.startswith("\ufeff"):
+            s = s.lstrip("\ufeff")
+        raw = json.loads(s)
         if not isinstance(raw, dict):
             raise ValueError(f"Invalid llm config (expected object): {path}")
         raw_models = raw.get("models", {})

@@ -11,18 +11,44 @@ JsonDict = Dict[str, Any]
 
 def iter_jsonl(path: str, *, tolerate_errors: bool = True) -> Iterator[JsonDict]:
     """Yield dict objects from a JSONL file (one JSON object per line)."""
-    with open(path, "r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
+    # Read as bytes and decode per-line to survive encoding issues like:
+    #   'utf-8' codec can't decode byte 0xe9 in position ...: invalid continuation byte
+    # JSON syntax is ASCII; bad bytes should mostly appear inside string fields, so best-effort
+    # decoding (replace) is usually enough to keep the pipeline moving.
+    with open(path, "rb") as f:
+        for line_no, bline in enumerate(f, start=1):
+            bline = bline.strip()
+            if not bline:
                 continue
+            try:
+                line = bline.decode("utf-8")
+            except UnicodeDecodeError as e:
+                if not tolerate_errors:
+                    raise
+                # Best-effort: keep going with replacement characters.
+                line = bline.decode("utf-8", errors="replace")
+                print(
+                    f"[WARN] Non-UTF8 bytes on line {line_no} in {path}: {e}. Decoded with replacement.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            # Parse JSON; if it fails and we had replacement chars, try a legacy single-byte decode.
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError as e:
-                if tolerate_errors:
-                    print(f"[WARN] Invalid JSON on line {line_no} in {path}: {e}", file=sys.stderr, flush=True)
-                    continue
-                raise ValueError(f"Invalid JSON on line {line_no} in {path}: {e}") from e
+                if tolerate_errors and "\ufffd" in line:
+                    try:
+                        obj = json.loads(bline.decode("latin-1"))
+                    except Exception:
+                        print(f"[WARN] Invalid JSON on line {line_no} in {path}: {e}", file=sys.stderr, flush=True)
+                        continue
+                else:
+                    if tolerate_errors:
+                        print(f"[WARN] Invalid JSON on line {line_no} in {path}: {e}", file=sys.stderr, flush=True)
+                        continue
+                    raise ValueError(f"Invalid JSON on line {line_no} in {path}: {e}") from e
+
             if not isinstance(obj, dict):
                 if tolerate_errors:
                     print(

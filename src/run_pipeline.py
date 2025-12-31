@@ -985,8 +985,9 @@ def main() -> None:
     stage1_dir = os.path.join(args.out, "stage1") if not args.stage1 else str(args.stage1)
     stage2_dir = os.path.join(args.out, "stage2")
     stage3_dir = os.path.join(args.out, "stage3")
-    if not os.path.isdir(stage1_dir):
-        os.makedirs(stage1_dir, exist_ok=True)
+    # In multi-worker setups, many environments may share the same `--out` directory.
+    # Directory creation must be idempotent and must not fail if the directories already exist.
+    os.makedirs(stage1_dir, exist_ok=True)
     os.makedirs(stage2_dir, exist_ok=True)
     os.makedirs(stage3_dir, exist_ok=True)
 
