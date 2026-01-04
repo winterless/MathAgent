@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import sys
 import time
 import re
 from typing import Any, Dict, List
@@ -105,6 +106,75 @@ def _input_prefix(path: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
     s = s.strip("._-")
     return s or "input"
+
+
+def _fmt_s(x: float) -> str:
+    try:
+        return f"{float(x):.2f}s"
+    except Exception:
+        return "0.00s"
+
+
+class _UUIDProgress:
+    """
+    Lightweight per-UUID progress printer (no external deps).
+
+    Shows:
+      - percent
+      - done/total UUIDs (done includes previously-done + newly processed)
+      - avg seconds/uuid (only for newly processed in this run)
+    """
+
+    def __init__(self, *, label: str, total: int, already_done: int = 0, prefix: str = "") -> None:
+        self.label = str(label or "stage").strip()
+        self.prefix = str(prefix or "").strip()
+        self.total = int(total or 0)
+        self.already_done = int(already_done or 0)
+        self.processed = 0
+        self.sum_uuid_s = 0.0
+        self._last_print = 0.0
+
+    def start(self) -> None:
+        self._print(force=True)
+
+    def tick(self, uuid_s: float) -> None:
+        self.processed += 1
+        try:
+            self.sum_uuid_s += float(uuid_s)
+        except Exception:
+            pass
+        self._print(force=False)
+
+    def finish(self) -> None:
+        self._print(force=True, final=True)
+
+    def _print(self, *, force: bool, final: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._last_print) < 0.25:
+            return
+        self._last_print = now
+        done_total = self.already_done + self.processed
+        if self.total <= 0:
+            pct = 100.0
+        else:
+            pct = 100.0 * float(done_total) / float(self.total)
+            if pct > 100.0:
+                pct = 100.0
+        avg = (self.sum_uuid_s / float(self.processed)) if self.processed > 0 else 0.0
+        tag = f"{self.label}" + (f"/{self.prefix}" if self.prefix else "")
+        msg = f"[{tag}] {pct:6.2f}% ({done_total}/{self.total}) avg {avg:.2f}s/uuid"
+        try:
+            sys.stderr.write("\r" + msg + "\033[K")
+            if final:
+                sys.stderr.write("\n")
+            sys.stderr.flush()
+        except Exception:
+            # Best-effort progress output; never fail pipeline.
+            if final:
+                try:
+                    print(msg, file=sys.stderr, flush=True)
+                except Exception:
+                    pass
 
 
 # ---- Route-A modular modes (infer/eval split for stage2/stage3) ----
@@ -322,13 +392,15 @@ def mode_stage1_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
                     infer_done.add(str(uu))
 
         rows = [normalize_record(r) for r in _read_all(input_path)]
-        for r in rows:
+        all_uuid_rows = [r for r in rows if r.get("uuid") is not None]
+        to_process = [r for r in all_uuid_rows if str(r.get("uuid")) not in infer_done]
+        prog = _UUIDProgress(label="stage1_infer", prefix=prefix, total=len(all_uuid_rows), already_done=len(all_uuid_rows) - len(to_process))
+        prog.start()
+
+        for r in to_process:
+            t0 = time.monotonic()
             uuid = r.get("uuid")
-            if uuid is None:
-                continue
             uuid_key = str(uuid)
-            if uuid_key in infer_done:
-                continue
 
             q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
             gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
@@ -381,8 +453,10 @@ def mode_stage1_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
                     "raw_source_path": r.get("raw_source_path"),
                 },
             )
+            prog.tick(time.monotonic() - t0)
 
         outs.append(stage1_infer_path)
+        prog.finish()
 
     return outs
 
@@ -410,13 +484,22 @@ def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
         stage1_done = _load_status_map(stage1_status_path)
         stage2_inputs: List[Dict[str, Any]] = []
 
+        all_rows: List[Dict[str, Any]] = []
         for r in iter_jsonl(stage1_infer_path, tolerate_errors=True):
             uuid = r.get("uuid")
             if uuid is None:
                 continue
             uuid_key = str(uuid)
-            if uuid_key in stage1_done:
-                continue
+            all_rows.append(r)
+
+        to_process = [r for r in all_rows if str(r.get("uuid")) not in stage1_done]
+        prog = _UUIDProgress(label="stage1_eval", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
+        prog.start()
+
+        for r in to_process:
+            t0 = time.monotonic()
+            uuid = r.get("uuid")
+            uuid_key = str(uuid)
 
             q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
             gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
@@ -563,10 +646,12 @@ def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                         "_difficulty": int(route_bad),
                     }
                 )
+            prog.tick(time.monotonic() - t0)
 
         if stage2_inputs:
             write_jsonl_atomic(stage2_input_path, stage2_inputs)
         outs.append(stage1_status_path)
+        prog.finish()
 
     return outs
 
@@ -683,13 +768,15 @@ def mode_stage2_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
                 if uu is not None:
                     infer_done.add(str(uu))
 
-        for r in candidates:
+        all_uuid_rows = [r for r in candidates if r.get("uuid") is not None]
+        to_process = [r for r in all_uuid_rows if str(r.get("uuid")) not in infer_done]
+        prog = _UUIDProgress(label="stage2_infer", prefix=prefix, total=len(all_uuid_rows), already_done=len(all_uuid_rows) - len(to_process))
+        prog.start()
+
+        for r in to_process:
+            t0 = time.monotonic()
             uuid = r.get("uuid")
-            if uuid is None:
-                continue
             uuid_key = str(uuid)
-            if uuid_key in infer_done:
-                continue
             q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
             gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
             model_q = append_choice_map_if_any(normalize_for_model(q_raw))
@@ -730,8 +817,10 @@ def mode_stage2_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
                     },
                 },
             )
+            prog.tick(time.monotonic() - t0)
 
         outs.append(stage2_infer_path)
+        prog.finish()
     return outs
 
 
@@ -758,13 +847,21 @@ def mode_stage2_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
         done = _load_status_map(stage2_status_path)
         stage3_inputs: List[Dict[str, Any]] = []
 
+        all_rows: List[Dict[str, Any]] = []
         for r in iter_jsonl(stage2_infer_path, tolerate_errors=True):
             uuid = r.get("uuid")
             if uuid is None:
                 continue
+            all_rows.append(r)
+
+        to_process = [r for r in all_rows if str(r.get("uuid")) not in done]
+        prog = _UUIDProgress(label="stage2_eval", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
+        prog.start()
+
+        for r in to_process:
+            t0 = time.monotonic()
+            uuid = r.get("uuid")
             uuid_key = str(uuid)
-            if uuid_key in done:
-                continue
             q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
             gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
             model_q = r.get("model_input") if isinstance(r.get("model_input"), str) else append_choice_map_if_any(normalize_for_model(q_raw))
@@ -900,10 +997,12 @@ def mode_stage2_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                         "_stage1_bad": r.get("stage1_bad"),
                     }
                 )
+            prog.tick(time.monotonic() - t0)
 
         if stage3_inputs:
             write_jsonl_atomic(stage3_input_path, stage3_inputs)
         outs.append(stage2_status_path)
+        prog.finish()
 
     return outs
 
@@ -930,13 +1029,21 @@ def mode_stage3_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
                 if uu is not None:
                     infer_done.add(str(uu))
 
+        all_rows: List[Dict[str, Any]] = []
         for r in iter_jsonl(stage3_input_path, tolerate_errors=True):
             uuid = r.get("uuid")
             if uuid is None:
                 continue
+            all_rows.append(r)
+
+        to_process = [r for r in all_rows if str(r.get("uuid")) not in infer_done]
+        prog = _UUIDProgress(label="stage3_infer", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
+        prog.start()
+
+        for r in to_process:
+            t0 = time.monotonic()
+            uuid = r.get("uuid")
             uuid_key = str(uuid)
-            if uuid_key in infer_done:
-                continue
             q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
             gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
             model_q = append_choice_map_if_any(normalize_for_model(q_raw))
@@ -977,7 +1084,9 @@ def mode_stage3_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
                     },
                 },
             )
+            prog.tick(time.monotonic() - t0)
         outs.append(stage3_infer_path)
+        prog.finish()
     return outs
 
 
@@ -1016,13 +1125,21 @@ def mode_stage3_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                 if u is not None:
                     result_done.add(str(u))
 
+        all_rows: List[Dict[str, Any]] = []
         for r in iter_jsonl(stage3_infer_path, tolerate_errors=True):
             uuid = r.get("uuid")
             if uuid is None:
                 continue
+            all_rows.append(r)
+
+        to_process = [r for r in all_rows if str(r.get("uuid")) not in stage3_done]
+        prog = _UUIDProgress(label="stage3_eval", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
+        prog.start()
+
+        for r in to_process:
+            t0 = time.monotonic()
+            uuid = r.get("uuid")
             uuid_key = str(uuid)
-            if uuid_key in stage3_done:
-                continue
             q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
             gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
             model_q = r.get("model_input") if isinstance(r.get("model_input"), str) else append_choice_map_if_any(normalize_for_model(q_raw))
@@ -1146,8 +1263,10 @@ def mode_stage3_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                     "paths": {"infer": stage3_infer_path, "archive": stage3_archive_path, "result": result_path},
                 },
             )
+            prog.tick(time.monotonic() - t0)
 
         outs.append(stage3_status_path)
+        prog.finish()
 
     return outs
 
@@ -1488,11 +1607,14 @@ def _run_one_input(
 
     # ---- Stage 1: per-uuid checkpointing (append) ----
     if start_stage == "stage1":
-        for r in normalized:
+        all_stage1 = [r for r in normalized if r.get("uuid") is not None]
+        to_process_stage1 = [r for r in all_stage1 if str(r.get("uuid")) not in stage1_done]
+        prog1 = _UUIDProgress(label="stage1", prefix=prefix, total=len(all_stage1), already_done=len(all_stage1) - len(to_process_stage1))
+        prog1.start()
+        for r in to_process_stage1:
+            t0 = time.monotonic()
             uuid = r.get("uuid")
             uuid_key = str(uuid)
-            if uuid_key in stage1_done:
-                continue
 
             q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
             gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
@@ -1653,6 +1775,8 @@ def _run_one_input(
             # NOTE: By design we do NOT put Stage1-accepted samples into `accepted_bank`.
             # Rationale: Stage1-accepted cases are considered "too easy" and we keep them only in stage1 artifacts.
             stage1_done[uuid_key] = {"uuid": uuid, "ok": int(route_ok), "bad": int(route_bad), "next_stage": next_stage}
+            prog1.tick(time.monotonic() - t0)
+        prog1.finish()
 
     # ---- Stage 2/3 ----
     # Stage2/Stage3 do NOT need Stage1 output files. They only need:
@@ -1703,11 +1827,13 @@ def _run_one_input(
         hard_rows.append(r)
 
     stage3_candidates: List[Dict[str, Any]] = []
-    for r in hard_rows:
+    to_process_stage2 = [r for r in hard_rows if str(r.get("uuid")) not in stage2_done]
+    prog2 = _UUIDProgress(label="stage2", prefix=prefix, total=len(hard_rows), already_done=len(hard_rows) - len(to_process_stage2))
+    prog2.start()
+    for r in to_process_stage2:
+        t0 = time.monotonic()
         uuid = r.get("uuid")
         uuid_key = str(uuid)
-        if uuid_key in stage2_done:
-            continue
         q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
         gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
         model_q = append_choice_map_if_any(normalize_for_model(q_raw))
@@ -1848,6 +1974,8 @@ def _run_one_input(
         stage2_done[uuid_key] = {"uuid": uuid, "ok": int(ok2), "bad": int(n2 - ok2), "next_stage": next_stage}
         if next_stage == "stage3":
             stage3_candidates.append(r)
+        prog2.tick(time.monotonic() - t0)
+    prog2.finish()
 
     for u_str, st in stage2_done.items():
         if (st.get("next_stage") or "") != "stage3":
@@ -1859,11 +1987,13 @@ def _run_one_input(
             r["_stage1_bad"] = st.get("stage1_bad")
             stage3_candidates.append(r)
 
-    for r in stage3_candidates:
+    to_process_stage3 = [r for r in stage3_candidates if str(r.get("uuid")) not in stage3_done]
+    prog3 = _UUIDProgress(label="stage3", prefix=prefix, total=len(stage3_candidates), already_done=len(stage3_candidates) - len(to_process_stage3))
+    prog3.start()
+    for r in to_process_stage3:
+        t0 = time.monotonic()
         uuid = r.get("uuid")
         uuid_key = str(uuid)
-        if uuid_key in stage3_done:
-            continue
         q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
         gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
         model_q = append_choice_map_if_any(normalize_for_model(q_raw))
@@ -2003,6 +2133,8 @@ def _run_one_input(
             },
         )
         stage3_done[uuid_key] = {"uuid": uuid, "ok": int(ok3), "bad": int(n3 - ok3), "next_stage": next_stage}
+        prog3.tick(time.monotonic() - t0)
+    prog3.finish()
 
     print("Done.")
     print(f"- input: {input_path}")
