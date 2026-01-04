@@ -59,15 +59,15 @@
     "stage3_judge": { "n": 1, "temperature": 0, "max_tokens": 16384 }
   },
   "thresholds": {
-    "min_votes_to_accept": 3
+    "min_votes_to_accept": 5
   },
   "options": {
     "finish_early": true,
-    "debug_print_prompts": true,
+    "debug_print_prompts": false,
     "debug_print_prompts_max_chars": 4000,
     "debug_print_outputs": true,
     "debug_print_outputs_max_chars": 2000,
-    "debug_stream_outputs": true,
+    "debug_stream_outputs": false,
     "think_tag_default": "",
     "think_tag_by_profile": {
       "base": "",

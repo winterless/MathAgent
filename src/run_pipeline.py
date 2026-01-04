@@ -473,7 +473,28 @@ def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
     stage2_dir = dirs["stage2"]
 
     outs: List[str] = []
-    for stage1_infer_path in _iter_artifacts(input_arg, suffix="stage1_infer.stage1.jsonl"):
+    infer_paths = _iter_artifacts(input_arg, suffix="stage1_infer.stage1.jsonl")
+    multi = os.path.isdir(input_arg) and len(infer_paths) > 1
+    overall: _UUIDProgress | None = None
+    if multi:
+        total_all = 0
+        done_all = 0
+        for p in infer_paths:
+            prefix = _infer_prefix_from_artifact(p, suffix="stage1_infer.stage1.jsonl")
+            pfx = f"{prefix}." if prefix else ""
+            stage1_status_path = os.path.join(dirs["stage1"], f"{pfx}status.stage1.jsonl")
+            done_map = _load_status_map(stage1_status_path)
+            uuids: List[str] = []
+            for r in iter_jsonl(p, tolerate_errors=True):
+                u = r.get("uuid")
+                if u is not None:
+                    uuids.append(str(u))
+            total_all += len(uuids)
+            done_all += sum(1 for u in uuids if u in done_map)
+        overall = _UUIDProgress(label="stage1_eval", total=total_all, already_done=done_all, prefix="ALL")
+        overall.start()
+
+    for stage1_infer_path in infer_paths:
         prefix = _infer_prefix_from_artifact(stage1_infer_path, suffix="stage1_infer.stage1.jsonl")
         pfx = f"{prefix}." if prefix else ""
         stage1_output_path = os.path.join(stage1_dir, f"{pfx}stage1_output.stage1.jsonl")
@@ -493,8 +514,10 @@ def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
             all_rows.append(r)
 
         to_process = [r for r in all_rows if str(r.get("uuid")) not in stage1_done]
-        prog = _UUIDProgress(label="stage1_eval", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
-        prog.start()
+        prog: _UUIDProgress | None = None
+        if not multi:
+            prog = _UUIDProgress(label="stage1_eval", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
+            prog.start()
 
         for r in to_process:
             t0 = time.monotonic()
@@ -646,13 +669,20 @@ def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                         "_difficulty": int(route_bad),
                     }
                 )
-            prog.tick(time.monotonic() - t0)
+            dt = time.monotonic() - t0
+            if prog is not None:
+                prog.tick(dt)
+            if overall is not None:
+                overall.tick(dt)
 
         if stage2_inputs:
             write_jsonl_atomic(stage2_input_path, stage2_inputs)
         outs.append(stage1_status_path)
-        prog.finish()
+        if prog is not None:
+            prog.finish()
 
+    if overall is not None:
+        overall.finish()
     return outs
 
 
@@ -676,6 +706,33 @@ def mode_stage2_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
             artifact_paths = _iter_artifacts(input_arg, suffix="stage1_output.stage1.jsonl")
     else:
         artifact_paths = [input_arg]
+
+    multi = os.path.isdir(input_arg) and len(artifact_paths) > 1 and all(
+        os.path.basename(p).endswith("stage2_input.stage2.jsonl") for p in artifact_paths
+    )
+    overall: _UUIDProgress | None = None
+    if multi:
+        total_all = 0
+        done_all = 0
+        for in_path in artifact_paths:
+            prefix = _infer_prefix_from_artifact(in_path, suffix="stage2_input.stage2.jsonl")
+            pfx = f"{prefix}." if prefix else ""
+            stage2_infer_path = os.path.join(stage2_dir, f"{pfx}stage2_infer.stage2.jsonl")
+            uuids: List[str] = []
+            for row in iter_jsonl(in_path, tolerate_errors=True):
+                u = row.get("uuid")
+                if u is not None:
+                    uuids.append(str(u))
+            total_all += len(uuids)
+            if os.path.exists(stage2_infer_path):
+                infer_done: set[str] = set()
+                for rr in iter_jsonl(stage2_infer_path, tolerate_errors=True):
+                    u2 = rr.get("uuid")
+                    if u2 is not None:
+                        infer_done.add(str(u2))
+                done_all += sum(1 for u in uuids if u in infer_done)
+        overall = _UUIDProgress(label="stage2_infer", total=total_all, already_done=done_all, prefix="ALL")
+        overall.start()
 
     for in_path in artifact_paths:
         base = os.path.basename(in_path)
@@ -770,8 +827,10 @@ def mode_stage2_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
 
         all_uuid_rows = [r for r in candidates if r.get("uuid") is not None]
         to_process = [r for r in all_uuid_rows if str(r.get("uuid")) not in infer_done]
-        prog = _UUIDProgress(label="stage2_infer", prefix=prefix, total=len(all_uuid_rows), already_done=len(all_uuid_rows) - len(to_process))
-        prog.start()
+        prog: _UUIDProgress | None = None
+        if not multi:
+            prog = _UUIDProgress(label="stage2_infer", prefix=prefix, total=len(all_uuid_rows), already_done=len(all_uuid_rows) - len(to_process))
+            prog.start()
 
         for r in to_process:
             t0 = time.monotonic()
@@ -817,10 +876,17 @@ def mode_stage2_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
                     },
                 },
             )
-            prog.tick(time.monotonic() - t0)
+            dt = time.monotonic() - t0
+            if prog is not None:
+                prog.tick(dt)
+            if overall is not None:
+                overall.tick(dt)
 
         outs.append(stage2_infer_path)
-        prog.finish()
+        if prog is not None:
+            prog.finish()
+    if overall is not None:
+        overall.finish()
     return outs
 
 
@@ -836,7 +902,28 @@ def mode_stage2_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
     stage3_dir = dirs["stage3"]
     outs: List[str] = []
 
-    for stage2_infer_path in _iter_artifacts(input_arg, suffix="stage2_infer.stage2.jsonl"):
+    infer_paths = _iter_artifacts(input_arg, suffix="stage2_infer.stage2.jsonl")
+    multi = os.path.isdir(input_arg) and len(infer_paths) > 1
+    overall: _UUIDProgress | None = None
+    if multi:
+        total_all = 0
+        done_all = 0
+        for p in infer_paths:
+            prefix = _infer_prefix_from_artifact(p, suffix="stage2_infer.stage2.jsonl")
+            pfx = f"{prefix}." if prefix else ""
+            stage2_status_path = os.path.join(stage2_dir, f"{pfx}status.stage2.jsonl")
+            done_map = _load_status_map(stage2_status_path)
+            uuids: List[str] = []
+            for r in iter_jsonl(p, tolerate_errors=True):
+                u = r.get("uuid")
+                if u is not None:
+                    uuids.append(str(u))
+            total_all += len(uuids)
+            done_all += sum(1 for u in uuids if u in done_map)
+        overall = _UUIDProgress(label="stage2_eval", total=total_all, already_done=done_all, prefix="ALL")
+        overall.start()
+
+    for stage2_infer_path in infer_paths:
         prefix = _infer_prefix_from_artifact(stage2_infer_path, suffix="stage2_infer.stage2.jsonl")
         pfx = f"{prefix}." if prefix else ""
         stage2_archive_path = os.path.join(stage2_dir, f"{pfx}stage2_archive.stage2.jsonl")
@@ -855,8 +942,10 @@ def mode_stage2_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
             all_rows.append(r)
 
         to_process = [r for r in all_rows if str(r.get("uuid")) not in done]
-        prog = _UUIDProgress(label="stage2_eval", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
-        prog.start()
+        prog: _UUIDProgress | None = None
+        if not multi:
+            prog = _UUIDProgress(label="stage2_eval", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
+            prog.start()
 
         for r in to_process:
             t0 = time.monotonic()
@@ -997,13 +1086,20 @@ def mode_stage2_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                         "_stage1_bad": r.get("stage1_bad"),
                     }
                 )
-            prog.tick(time.monotonic() - t0)
+            dt = time.monotonic() - t0
+            if prog is not None:
+                prog.tick(dt)
+            if overall is not None:
+                overall.tick(dt)
 
         if stage3_inputs:
             write_jsonl_atomic(stage3_input_path, stage3_inputs)
         outs.append(stage2_status_path)
-        prog.finish()
+        if prog is not None:
+            prog.finish()
 
+    if overall is not None:
+        overall.finish()
     return outs
 
 
@@ -1017,7 +1113,33 @@ def mode_stage3_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
     stage3_dir = dirs["stage3"]
     outs: List[str] = []
 
-    for stage3_input_path in _iter_artifacts(input_arg, suffix="stage3_input.stage3.jsonl"):
+    input_paths = _iter_artifacts(input_arg, suffix="stage3_input.stage3.jsonl")
+    multi = os.path.isdir(input_arg) and len(input_paths) > 1
+    overall: _UUIDProgress | None = None
+    if multi:
+        total_all = 0
+        done_all = 0
+        for p in input_paths:
+            prefix = _infer_prefix_from_artifact(p, suffix="stage3_input.stage3.jsonl")
+            pfx = f"{prefix}." if prefix else ""
+            stage3_infer_path = os.path.join(stage3_dir, f"{pfx}stage3_infer.stage3.jsonl")
+            uuids: List[str] = []
+            for r in iter_jsonl(p, tolerate_errors=True):
+                u = r.get("uuid")
+                if u is not None:
+                    uuids.append(str(u))
+            total_all += len(uuids)
+            if os.path.exists(stage3_infer_path):
+                infer_done: set[str] = set()
+                for rr in iter_jsonl(stage3_infer_path, tolerate_errors=True):
+                    u2 = rr.get("uuid")
+                    if u2 is not None:
+                        infer_done.add(str(u2))
+                done_all += sum(1 for u in uuids if u in infer_done)
+        overall = _UUIDProgress(label="stage3_infer", total=total_all, already_done=done_all, prefix="ALL")
+        overall.start()
+
+    for stage3_input_path in input_paths:
         prefix = _infer_prefix_from_artifact(stage3_input_path, suffix="stage3_input.stage3.jsonl")
         pfx = f"{prefix}." if prefix else ""
         stage3_infer_path = os.path.join(stage3_dir, f"{pfx}stage3_infer.stage3.jsonl")
@@ -1037,8 +1159,10 @@ def mode_stage3_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
             all_rows.append(r)
 
         to_process = [r for r in all_rows if str(r.get("uuid")) not in infer_done]
-        prog = _UUIDProgress(label="stage3_infer", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
-        prog.start()
+        prog: _UUIDProgress | None = None
+        if not multi:
+            prog = _UUIDProgress(label="stage3_infer", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
+            prog.start()
 
         for r in to_process:
             t0 = time.monotonic()
@@ -1084,9 +1208,16 @@ def mode_stage3_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
                     },
                 },
             )
-            prog.tick(time.monotonic() - t0)
+            dt = time.monotonic() - t0
+            if prog is not None:
+                prog.tick(dt)
+            if overall is not None:
+                overall.tick(dt)
         outs.append(stage3_infer_path)
-        prog.finish()
+        if prog is not None:
+            prog.finish()
+    if overall is not None:
+        overall.finish()
     return outs
 
 
@@ -1101,7 +1232,28 @@ def mode_stage3_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
     stage3_dir = dirs["stage3"]
     outs: List[str] = []
 
-    for stage3_infer_path in _iter_artifacts(input_arg, suffix="stage3_infer.stage3.jsonl"):
+    infer_paths = _iter_artifacts(input_arg, suffix="stage3_infer.stage3.jsonl")
+    multi = os.path.isdir(input_arg) and len(infer_paths) > 1
+    overall: _UUIDProgress | None = None
+    if multi:
+        total_all = 0
+        done_all = 0
+        for p in infer_paths:
+            prefix = _infer_prefix_from_artifact(p, suffix="stage3_infer.stage3.jsonl")
+            pfx = f"{prefix}." if prefix else ""
+            stage3_status_path = os.path.join(stage3_dir, f"{pfx}status.stage3.jsonl")
+            done_map = _load_status_map(stage3_status_path)
+            uuids: List[str] = []
+            for r in iter_jsonl(p, tolerate_errors=True):
+                u = r.get("uuid")
+                if u is not None:
+                    uuids.append(str(u))
+            total_all += len(uuids)
+            done_all += sum(1 for u in uuids if u in done_map)
+        overall = _UUIDProgress(label="stage3_eval", total=total_all, already_done=done_all, prefix="ALL")
+        overall.start()
+
+    for stage3_infer_path in infer_paths:
         prefix = _infer_prefix_from_artifact(stage3_infer_path, suffix="stage3_infer.stage3.jsonl")
         pfx = f"{prefix}." if prefix else ""
         stage3_archive_path = os.path.join(stage3_dir, f"{pfx}stage3_archive.stage3.jsonl")
@@ -1133,8 +1285,10 @@ def mode_stage3_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
             all_rows.append(r)
 
         to_process = [r for r in all_rows if str(r.get("uuid")) not in stage3_done]
-        prog = _UUIDProgress(label="stage3_eval", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
-        prog.start()
+        prog: _UUIDProgress | None = None
+        if not multi:
+            prog = _UUIDProgress(label="stage3_eval", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
+            prog.start()
 
         for r in to_process:
             t0 = time.monotonic()
@@ -1263,11 +1417,18 @@ def mode_stage3_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                     "paths": {"infer": stage3_infer_path, "archive": stage3_archive_path, "result": result_path},
                 },
             )
-            prog.tick(time.monotonic() - t0)
+            dt = time.monotonic() - t0
+            if prog is not None:
+                prog.tick(dt)
+            if overall is not None:
+                overall.tick(dt)
 
         outs.append(stage3_status_path)
-        prog.finish()
+        if prog is not None:
+            prog.finish()
 
+    if overall is not None:
+        overall.finish()
     return outs
 
 

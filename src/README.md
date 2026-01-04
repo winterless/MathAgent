@@ -49,7 +49,7 @@ Stage1 infer (produce raw solve outputs only):
 ```bash
 PYTHONPATH=src python3 src/run_pipeline.py \
   --mode stage1_infer \
-  --input datasets/example_input.jsonl \
+  --input datasets/input \
   --out datasets/out/demo_modular \
   --llm-config config/llm_models.json
 ```
