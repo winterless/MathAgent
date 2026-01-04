@@ -80,6 +80,86 @@ def _input_prefix(path: str) -> str:
     return s or "input"
 
 
+# ---- Route-A modular modes (infer/eval split for stage2/stage3) ----
+MODES = [
+    "full",
+    "stage1_infer",
+    "stage1_eval",
+    "stage2_infer",
+    "stage2_eval",
+    "stage3_infer",
+    "stage3_eval",
+]
+
+
+def _iter_artifacts(input_arg: str, *, suffix: str) -> List[str]:
+    """Return artifact file paths ending with suffix (input_arg may be file or directory)."""
+    if os.path.isdir(input_arg):
+        outs: List[str] = []
+        for name in os.listdir(input_arg):
+            if name.endswith(suffix) and name.lower().endswith(".jsonl"):
+                outs.append(os.path.join(input_arg, name))
+        outs.sort()
+        return outs
+    return [input_arg]
+
+
+def _infer_prefix_from_artifact(path: str, *, suffix: str) -> str:
+    """
+    Infer prefix from '<prefix>.<suffix>'.
+    If unprefixed (exactly suffix), fall back to parent directory name (reduces collisions).
+    """
+    base = os.path.basename(path)
+    if base == suffix:
+        parent = os.path.basename(os.path.dirname(path) or "")
+        return _input_prefix(parent) if parent else ""
+    dot_suf = "." + suffix
+    if base.endswith(dot_suf):
+        return base[: -len(dot_suf)]
+    # final fallback: use filename stem
+    stem, _ext = os.path.splitext(base)
+    return _input_prefix(stem)
+
+
+def _ensure_stage_dirs(out_dir: str) -> Dict[str, str]:
+    os.makedirs(out_dir, exist_ok=True)
+    stage1_dir = os.path.join(out_dir, "stage1")
+    stage2_dir = os.path.join(out_dir, "stage2")
+    stage3_dir = os.path.join(out_dir, "stage3")
+    os.makedirs(stage1_dir, exist_ok=True)
+    os.makedirs(stage2_dir, exist_ok=True)
+    os.makedirs(stage3_dir, exist_ok=True)
+    return {"stage1": stage1_dir, "stage2": stage2_dir, "stage3": stage3_dir}
+
+
+def _as_choice_letter(s: str) -> str:
+    """If s looks like 'A' or 'A.xxx', return 'A'; else return original trimmed string."""
+    if not isinstance(s, str):
+        return ""
+    ss = s.strip()
+    if not ss:
+        return ""
+    c0 = ss[0].upper()
+    if c0 in ("A", "B", "C", "D"):
+        return c0
+    return ss
+
+
+def _select_answer(*, gold: str, majority: Dict[str, Any], min_votes_to_accept: int) -> Dict[str, Any]:
+    """
+    Select the final answer for this stage:
+    - If voting is confident (majority_count >= min_votes_to_accept): use voting result
+    - Else: fall back to provided gold answer
+    """
+    maj_raw = str((majority or {}).get("majority") or "").strip()
+    maj_cnt = int((majority or {}).get("majority_count") or 0)
+    gold_letter = _as_choice_letter(gold)
+    maj_letter = _as_choice_letter(maj_raw)
+    if maj_cnt >= int(min_votes_to_accept) and maj_letter:
+        return {"final_answer": maj_letter, "final_source": "majority", "final_vote_count": maj_cnt}
+    return {"final_answer": gold_letter or gold.strip(), "final_source": "answer_fallback", "final_vote_count": maj_cnt}
+
+
 def _iter_stage1_output_paths(stage1_dir: str) -> List[str]:
     """
     Find stage1 output files under a stage1 directory.
@@ -110,6 +190,915 @@ def _stage1_output_prefix(path: str) -> str:
     return ""
 
 
+def _llm_judge_equivalence(
+    *,
+    llm: LLMRouter,
+    uuid: Any,
+    question: str,
+    gold: str,
+    pred: str,
+    choice_map: Dict[str, str],
+    stage: str,
+    sleep_s: float,
+    stats: Dict[str, int] | None = None,
+) -> bool | None:
+    """
+    Ask LLM to judge equivalence only when rules cannot decide.
+    Return True/False/None.
+    """
+    choice_lines = []
+    for k in ("A", "B", "C", "D"):
+        if k in choice_map:
+            choice_lines.append(f"{k} = {choice_map[k]}")
+    choice_block = "\n".join(choice_lines)
+    user = (
+        "你是“答案一致性判定器”，只判断 pred 是否与 gold 含义一致，禁止解题。\n"
+        "输出必须是且只能是三者之一：一致 / 不一致 / 不确定\n\n"
+        f"[题目]\n{question}\n\n"
+        f"[选项映射]\n{choice_block}\n\n"
+        f"[gold]\n{gold}\n\n"
+        f"[pred]\n{pred}\n"
+    ).strip()
+    resp = llm.generate_n(
+        stage_name=f"{stage}_judge",
+        question=user,
+        prompt_mode="raw_prompt",
+        sleep_s=sleep_s,
+        stats=stats,
+    )[0]
+    t = (resp or "").strip()
+    first = (t.splitlines()[0] if t else "").strip().strip("。.!！?？")
+    if first == "不确定":
+        return None
+    if first == "不一致":
+        return False
+    if first == "一致":
+        return True
+    return None
+
+
+def _to_result_entry(*, stage: str, final_answer: str, entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Minimal result entry (stage2/stage3 only)."""
+    answer = entry.get("answer")
+    answer = (answer or "").strip() if isinstance(answer, str) else ""
+    attempts = entry.get("attempts") if isinstance(entry.get("attempts"), list) else []
+    attempts_slim: List[Dict[str, Any]] = []
+    for a in attempts:
+        if not isinstance(a, dict):
+            continue
+        attempts_slim.append(
+            {
+                "raw_text": a.get("raw_text"),
+                "boxed_answer": a.get("boxed_answer"),
+                "verdict": a.get("verdict"),
+                "final_answer": final_answer,
+            }
+        )
+    return {
+        "uuid": entry.get("uuid"),
+        "question": entry.get("question"),
+        "answer": answer,
+        "stage": stage,
+        "final_answer": final_answer,
+        "majority_answer": entry.get("majority_answer"),
+        "attempts": attempts_slim,
+    }
+
+
+def mode_stage1_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_to_accept: int, sleep_s: float) -> List[str]:
+    """
+    Route-A mode: stage1_infer
+    Input: raw dataset JSONL (file) or a directory containing *.jsonl.
+    Output: stage1/<prefix>.stage1_infer.stage1.jsonl (raw solve outputs only, for stage1_eval).
+    """
+    dirs = _ensure_stage_dirs(out_dir)
+    stage1_dir = dirs["stage1"]
+
+    outs: List[str] = []
+    input_paths = _iter_input_jsonl_paths(input_arg)
+    for input_path in input_paths:
+        prefix = _input_prefix(input_path) if os.path.isfile(input_path) else _input_prefix(os.path.basename(input_path))
+        pfx = f"{prefix}." if prefix else ""
+        stage1_infer_path = os.path.join(stage1_dir, f"{pfx}stage1_infer.stage1.jsonl")
+
+        infer_done: set[str] = set()
+        if os.path.exists(stage1_infer_path):
+            for rr in iter_jsonl(stage1_infer_path, tolerate_errors=True):
+                uu = rr.get("uuid")
+                if uu is not None:
+                    infer_done.add(str(uu))
+
+        rows = [normalize_record(r) for r in _read_all(input_path)]
+        for r in rows:
+            uuid = r.get("uuid")
+            if uuid is None:
+                continue
+            uuid_key = str(uuid)
+            if uuid_key in infer_done:
+                continue
+
+            q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
+            gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
+            if not q_raw.strip():
+                raise ValueError(f"Missing question: uuid={uuid}")
+            if not gold:
+                raise ValueError(f"Missing gold in field 'answer': uuid={uuid}")
+
+            model_q = append_choice_map_if_any(normalize_for_model(q_raw))
+            choice_map = extract_choice_map(model_q)
+            s1_solve_stats: Dict[str, int] = {}
+            raw_solutions = llm.generate_n(
+                stage_name="stage1_solve",
+                question=model_q,
+                prompt_mode="problem",
+                sleep_s=sleep_s,
+                stats=s1_solve_stats,
+            )
+            n1 = int(llm.stage_params("stage1_solve").n)
+            extracted = [extract_final_answer(x) for x in raw_solutions]
+            standardized = [standardize_choice_answer(a, choice_map=choice_map) for a in extracted]
+
+            # Majority vote: filter empty answers to avoid false consensus on failures.
+            vote_inputs1 = [str(x or "").strip() for x in standardized][:n1]
+            vote_inputs1 = [x for x in vote_inputs1 if x]
+            v1 = majority_vote(vote_inputs1)
+            majority_answer_json = {"majority": v1.majority, "majority_count": int(v1.majority_count), "counts": dict(v1.counts)}
+
+            append_jsonl_line(
+                stage1_infer_path,
+                {
+                    "uuid": uuid,
+                    "line_number": r.get("line_number"),
+                    "stage": "stage1_infer",
+                    "question": q_raw,
+                    "answer": gold,
+                    "gold": gold,
+                    "model_input": model_q,
+                    "raw_model_outputs": [str(x) for x in raw_solutions][:n1],
+                    "extracted_answers": [str(x) for x in standardized][:n1],
+                    "majority_answer": majority_answer_json,
+                    "min_votes_to_accept": int(min_votes_to_accept),
+                    "llm_call_counts": {
+                        "stage1_solve": llm.stage_params("stage1_solve").n,
+                        "stage1_solve_http_calls": int(s1_solve_stats.get("http_calls", 0)),
+                        "stage1_solve_retries": int(s1_solve_stats.get("retries", 0)),
+                        "stage1_solve_timeouts": int(s1_solve_stats.get("timeouts", 0)),
+                        "stage1_solve_errors": int(s1_solve_stats.get("errors", 0)),
+                    },
+                    "raw_source_path": r.get("raw_source_path"),
+                },
+            )
+
+        outs.append(stage1_infer_path)
+
+    return outs
+
+
+def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_to_accept: int, sleep_s: float) -> List[str]:
+    """
+    Route-A mode: stage1_eval
+    Input: stage1_infer.stage1.jsonl (file) or directory containing *stage1_infer.stage1.jsonl.
+    Output: stage1/<prefix>.stage1_output.stage1.jsonl + stage1/<prefix>.status.stage1.jsonl
+            stage2/<prefix>.stage2_input.stage2.jsonl (for stage2_infer, optional convenience)
+    """
+    dirs = _ensure_stage_dirs(out_dir)
+    stage1_dir = dirs["stage1"]
+    stage2_dir = dirs["stage2"]
+
+    outs: List[str] = []
+    for stage1_infer_path in _iter_artifacts(input_arg, suffix="stage1_infer.stage1.jsonl"):
+        prefix = _infer_prefix_from_artifact(stage1_infer_path, suffix="stage1_infer.stage1.jsonl")
+        pfx = f"{prefix}." if prefix else ""
+        stage1_output_path = os.path.join(stage1_dir, f"{pfx}stage1_output.stage1.jsonl")
+        stage1_raw_generations_path = os.path.join(stage1_dir, f"{pfx}stage1_raw_generations.stage1.jsonl")
+        stage1_status_path = os.path.join(stage1_dir, f"{pfx}status.stage1.jsonl")
+        stage2_input_path = os.path.join(stage2_dir, f"{pfx}stage2_input.stage2.jsonl")
+
+        stage1_done = _load_status_map(stage1_status_path)
+        stage2_inputs: List[Dict[str, Any]] = []
+
+        for r in iter_jsonl(stage1_infer_path, tolerate_errors=True):
+            uuid = r.get("uuid")
+            if uuid is None:
+                continue
+            uuid_key = str(uuid)
+            if uuid_key in stage1_done:
+                continue
+
+            q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
+            gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
+            model_q = r.get("model_input") if isinstance(r.get("model_input"), str) else append_choice_map_if_any(normalize_for_model(q_raw))
+            choice_map = extract_choice_map(model_q)
+            raw_model_outputs = r.get("raw_model_outputs") if isinstance(r.get("raw_model_outputs"), list) else []
+            extracted_answers = r.get("extracted_answers") if isinstance(r.get("extracted_answers"), list) else []
+            majority_answer_json = r.get("majority_answer") if isinstance(r.get("majority_answer"), dict) else {"majority": "", "majority_count": 0, "counts": {}}
+            n1 = int(llm.stage_params("stage1_solve").n)
+
+            # Judge attempts (rule first, optional LLM judge).
+            stage1_attempts: List[Dict[str, Any]] = []
+            ok1 = 0
+            s1_judge_stats: Dict[str, int] = {}
+            for raw, pred_i in zip(raw_model_outputs[:n1], extracted_answers[:n1]):
+                boxed_i = extract_boxed_answer(str(raw))
+                extracted_final = boxed_i or str(pred_i)
+                pred_final = standardize_choice_answer(extracted_final, choice_map=choice_map)
+                eq = rule_equivalent(pred_final, gold, choice_map=choice_map)
+                judge_src = "rules"
+                if eq is None:
+                    eq = _llm_judge_equivalence(
+                        llm=llm,
+                        uuid=uuid,
+                        question=q_raw,
+                        gold=gold,
+                        pred=pred_final,
+                        choice_map=choice_map,
+                        stage="stage1",
+                        sleep_s=sleep_s,
+                        stats=s1_judge_stats,
+                    )
+                    judge_src = "llm" if eq is not None else "unknown"
+                verdict = "正确" if eq is True else ("错误" if eq is False else "不确定")
+                if eq is True:
+                    ok1 += 1
+                stage1_attempts.append(
+                    {
+                        "raw_text": str(raw),
+                        "boxed_answer": boxed_i,
+                        "extracted_answer": extracted_final,
+                        "normalized_answer": pred_final,
+                        "verdict": verdict,
+                        "judge_source": judge_src,
+                    }
+                )
+
+            stored_prompt = assemble_stored_prompt(
+                question=q_raw,
+                standard_answer="",
+                stage1_answers=[str(x) for x in extracted_answers][:n1],
+            )
+
+            # Eval prompt (must end with boxed counts ideally).
+            eval_user = f"{stored_prompt}\n\n[GOLD_STANDARD_ANSWER]={gold}\n"
+            eval_calls = 0
+            eval_text = ""
+            s1_eval_stats: Dict[str, int] = {}
+            for _ in range(2):
+                eval_calls += 1
+                eval_text = llm.generate_n(
+                    stage_name="stage1_eval",
+                    question=eval_user,
+                    prompt_mode="raw_prompt_eval",
+                    sleep_s=sleep_s,
+                    stats=s1_eval_stats,
+                )[0]
+                eval_text = strip_think(eval_text)
+                if extract_boxed_counts(eval_text) is not None:
+                    break
+
+            stage1_raw_entry: Dict[str, Any] = {
+                "uuid": uuid,
+                "line_number": r.get("line_number"),
+                "stage": "stage1",
+                "question": q_raw,
+                "gold": gold,
+                "model_input": model_q,
+                "raw_model_outputs": [str(x) for x in raw_model_outputs][:n1],
+                "extracted_answers": [str(x) for x in extracted_answers][:n1],
+                "majority_answer": majority_answer_json,
+                "attempts": stage1_attempts,
+                "ok": ok1,
+                "bad": n1 - ok1,
+                "llm_call_counts": {
+                    **(r.get("llm_call_counts") if isinstance(r.get("llm_call_counts"), dict) else {}),
+                    "stage1_eval": eval_calls,
+                    "stage1_eval_http_calls": int(s1_eval_stats.get("http_calls", 0)),
+                    "stage1_eval_retries": int(s1_eval_stats.get("retries", 0)),
+                    "stage1_eval_timeouts": int(s1_eval_stats.get("timeouts", 0)),
+                    "stage1_eval_errors": int(s1_eval_stats.get("errors", 0)),
+                    "stage1_judge_llm_fallback": sum(1 for a in stage1_attempts if a.get("judge_source") == "llm"),
+                    "stage1_judge_unknown": sum(1 for a in stage1_attempts if a.get("judge_source") == "unknown"),
+                    "stage1_judge_http_calls": int(s1_judge_stats.get("http_calls", 0)),
+                    "stage1_judge_retries": int(s1_judge_stats.get("retries", 0)),
+                    "stage1_judge_timeouts": int(s1_judge_stats.get("timeouts", 0)),
+                    "stage1_judge_errors": int(s1_judge_stats.get("errors", 0)),
+                },
+            }
+
+            out = normalize_output_wrapper(
+                {"status": "SUCCESS", "content": {"choices": [{"indext": 0, "message": {"role": "assistant", "content": eval_text}}]}},
+                uuid=uuid,
+                stage="stage1",
+            )
+            clean = {k: r.get(k) for k in CANONICAL_KEYS}
+            clean["prompt"] = stored_prompt
+            clean["output"] = out
+
+            append_jsonl_line(stage1_raw_generations_path, stage1_raw_entry)
+            append_jsonl_line(stage1_output_path, clean)
+
+            counts = extract_boxed_counts(eval_text)
+            route_ok, route_bad = (counts if counts is not None else (ok1, n1 - ok1))
+            sel1 = _select_answer(gold=gold, majority=majority_answer_json, min_votes_to_accept=min_votes_to_accept)
+            next_stage = "stage2" if int(majority_answer_json.get("majority_count", 0)) < int(min_votes_to_accept) else "accepted"
+            append_jsonl_line(
+                stage1_status_path,
+                {
+                    "uuid": uuid,
+                    "stage": "stage1",
+                    "ok": int(route_ok),
+                    "bad": int(route_bad),
+                    "eval_ok": int(counts[0]) if counts is not None else None,
+                    "eval_bad": int(counts[1]) if counts is not None else None,
+                    "judge_ok": int(ok1),
+                    "judge_bad": int(n1 - ok1),
+                    "min_votes_to_accept": int(min_votes_to_accept),
+                    "vote_majority": majority_answer_json.get("majority"),
+                    "vote_majority_count": int(majority_answer_json.get("majority_count", 0)),
+                    **sel1,
+                    "next_stage": next_stage,
+                    "paths": {"infer": stage1_infer_path, "raw_generations": stage1_raw_generations_path, "output": stage1_output_path},
+                },
+            )
+            stage1_done[uuid_key] = {"uuid": uuid, "ok": int(route_ok), "bad": int(route_bad), "next_stage": next_stage}
+
+            if next_stage == "stage2":
+                stage2_inputs.append(
+                    {
+                        **{k: r.get(k) for k in CANONICAL_KEYS},
+                        "_stage1_ok": int(route_ok),
+                        "_stage1_bad": int(route_bad),
+                        "_difficulty": int(route_bad),
+                    }
+                )
+
+        if stage2_inputs:
+            write_jsonl_atomic(stage2_input_path, stage2_inputs)
+        outs.append(stage1_status_path)
+
+    return outs
+
+
+def mode_stage2_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_to_accept: int, sleep_s: float) -> List[str]:
+    """
+    Route-A mode: stage2_infer
+    Input: stage1_output.stage1.jsonl (file) or a directory containing *stage1_output.stage1.jsonl files.
+    Output: stage2/<prefix>.stage2_infer.stage2.jsonl (one per input artifact)
+            stage2/<prefix>.stage2_input.stage2.jsonl (the derived next-step inputs)
+    """
+    dirs = _ensure_stage_dirs(out_dir)
+    stage2_dir = dirs["stage2"]
+
+    outs: List[str] = []
+    for stage1_output_path in _iter_artifacts(input_arg, suffix="stage1_output.stage1.jsonl"):
+        prefix = _infer_prefix_from_artifact(stage1_output_path, suffix="stage1_output.stage1.jsonl")
+        pfx = f"{prefix}." if prefix else ""
+        stage2_infer_path = os.path.join(stage2_dir, f"{pfx}stage2_infer.stage2.jsonl")
+        stage2_input_path = os.path.join(stage2_dir, f"{pfx}stage2_input.stage2.jsonl")
+
+        # Prefer status-driven routing.
+        # If status is available, use:
+        #   next_stage = stage2  <=>  final_vote_count < min_votes_to_accept
+        # Otherwise, fall back to stage1_output's eval boxed counts (best-effort).
+        stage1_status_path = os.path.join(os.path.dirname(stage1_output_path), f"{pfx}status.stage1.jsonl")
+        stage1_status = _load_status_map(stage1_status_path)
+
+        candidates: List[Dict[str, Any]] = []
+        for row in iter_jsonl(stage1_output_path, tolerate_errors=True):
+            u = row.get("uuid")
+            if u is None:
+                continue
+            u_key = str(u)
+
+            st = stage1_status.get(u_key, {})
+            fv = st.get("final_vote_count")
+            mv = st.get("min_votes_to_accept")
+            try:
+                fv_i = int(fv) if fv is not None else None
+            except Exception:
+                fv_i = None
+            try:
+                mv_i = int(mv) if mv is not None else int(min_votes_to_accept)
+            except Exception:
+                mv_i = int(min_votes_to_accept)
+
+            # Determine whether this uuid should enter stage2
+            if fv_i is not None:
+                need_stage2 = fv_i < mv_i
+            else:
+                # fallback: use saved next_stage if present
+                need_stage2 = str(st.get("next_stage") or "") == "stage2"
+
+            if not need_stage2:
+                # Accepted at stage1 (or no routing info says stage2)
+                continue
+
+            # Difficulty/ok/bad: prefer status if present.
+            okc = st.get("ok")
+            badc = st.get("bad")
+            try:
+                okc_i = int(okc) if okc is not None else 0
+            except Exception:
+                okc_i = 0
+            try:
+                badc_i = int(badc) if badc is not None else 0
+            except Exception:
+                badc_i = 0
+
+            # If no status exists, best-effort parse eval boxed counts from stage1_output content.
+            if not stage1_status:
+                counts = extract_boxed_counts_from_output(row.get("output"))
+                if counts is not None:
+                    okc_i, badc_i = int(counts[0]), int(counts[1])
+
+            diff = badc_i
+            candidates.append(
+                {
+                    **{k: row.get(k) for k in CANONICAL_KEYS},
+                    "_stage1_ok": int(okc),
+                    "_stage1_bad": int(badc),
+                    "_difficulty": int(diff),
+                }
+            )
+
+        if candidates:
+            write_jsonl_atomic(stage2_input_path, candidates)
+
+        infer_done: set[str] = set()
+        if os.path.exists(stage2_infer_path):
+            for r in iter_jsonl(stage2_infer_path, tolerate_errors=True):
+                uu = r.get("uuid")
+                if uu is not None:
+                    infer_done.add(str(uu))
+
+        for r in candidates:
+            uuid = r.get("uuid")
+            if uuid is None:
+                continue
+            uuid_key = str(uuid)
+            if uuid_key in infer_done:
+                continue
+            q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
+            gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
+            model_q = append_choice_map_if_any(normalize_for_model(q_raw))
+            choice_map = extract_choice_map(model_q)
+            s2_solve_stats: Dict[str, int] = {}
+            raw_solutions = llm.generate_n(
+                stage_name="stage2_solve",
+                question=model_q,
+                prompt_mode="boxed_solve",
+                sleep_s=sleep_s,
+                stats=s2_solve_stats,
+            )
+            n2 = int(llm.stage_params("stage2_solve").n)
+            extracted = [extract_final_answer(x) for x in raw_solutions]
+            standardized = [standardize_choice_answer(a, choice_map=choice_map) for a in extracted]
+            append_jsonl_line(
+                stage2_infer_path,
+                {
+                    "uuid": uuid,
+                    "line_number": r.get("line_number"),
+                    "stage": "stage2_infer",
+                    "difficulty": r.get("_difficulty"),
+                    "question": q_raw,
+                    "answer": gold,
+                    "gold": gold,
+                    "model_input": model_q,
+                    "raw_model_outputs": [str(x) for x in raw_solutions][:n2],
+                    "extracted_answers": [str(x) for x in standardized][:n2],
+                    "stage1_ok": r.get("_stage1_ok"),
+                    "stage1_bad": r.get("_stage1_bad"),
+                    "min_votes_to_accept": int(min_votes_to_accept),
+                    "llm_call_counts": {
+                        "stage2_solve": llm.stage_params("stage2_solve").n,
+                        "stage2_solve_http_calls": int(s2_solve_stats.get("http_calls", 0)),
+                        "stage2_solve_retries": int(s2_solve_stats.get("retries", 0)),
+                        "stage2_solve_timeouts": int(s2_solve_stats.get("timeouts", 0)),
+                        "stage2_solve_errors": int(s2_solve_stats.get("errors", 0)),
+                    },
+                },
+            )
+
+        outs.append(stage2_infer_path)
+    return outs
+
+
+def mode_stage2_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_to_accept: int, sleep_s: float) -> List[str]:
+    """
+    Route-A mode: stage2_eval
+    Input: stage2_infer.stage2.jsonl (file) or directory containing *stage2_infer.stage2.jsonl files.
+    Output: stage2/<prefix>.stage2_archive.stage2.jsonl + stage2/<prefix>.status.stage2.jsonl
+            stage3/<prefix>.stage3_input.stage3.jsonl (for stage3_infer)
+    """
+    dirs = _ensure_stage_dirs(out_dir)
+    stage2_dir = dirs["stage2"]
+    stage3_dir = dirs["stage3"]
+    outs: List[str] = []
+
+    for stage2_infer_path in _iter_artifacts(input_arg, suffix="stage2_infer.stage2.jsonl"):
+        prefix = _infer_prefix_from_artifact(stage2_infer_path, suffix="stage2_infer.stage2.jsonl")
+        pfx = f"{prefix}." if prefix else ""
+        stage2_archive_path = os.path.join(stage2_dir, f"{pfx}stage2_archive.stage2.jsonl")
+        stage2_raw_generations_path = os.path.join(stage2_dir, f"{pfx}stage2_raw_generations.stage2.jsonl")
+        stage2_status_path = os.path.join(stage2_dir, f"{pfx}status.stage2.jsonl")
+        stage3_input_path = os.path.join(stage3_dir, f"{pfx}stage3_input.stage3.jsonl")
+
+        done = _load_status_map(stage2_status_path)
+        stage3_inputs: List[Dict[str, Any]] = []
+
+        for r in iter_jsonl(stage2_infer_path, tolerate_errors=True):
+            uuid = r.get("uuid")
+            if uuid is None:
+                continue
+            uuid_key = str(uuid)
+            if uuid_key in done:
+                continue
+            q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
+            gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
+            model_q = r.get("model_input") if isinstance(r.get("model_input"), str) else append_choice_map_if_any(normalize_for_model(q_raw))
+            choice_map = extract_choice_map(model_q)
+            raw_model_outputs = r.get("raw_model_outputs") if isinstance(r.get("raw_model_outputs"), list) else []
+            extracted_answers = r.get("extracted_answers") if isinstance(r.get("extracted_answers"), list) else []
+            n2 = int(llm.stage_params("stage2_solve").n)
+
+            stage2_attempts: List[Dict[str, Any]] = []
+            ok2 = 0
+            s2_judge_stats: Dict[str, int] = {}
+            for raw, pred_i in zip(raw_model_outputs[:n2], extracted_answers[:n2]):
+                boxed_i = extract_boxed_answer(str(raw))
+                extracted_final = boxed_i or str(pred_i)
+                pred_final = standardize_choice_answer(extracted_final, choice_map=choice_map)
+                eq = rule_equivalent(pred_final, gold, choice_map=choice_map)
+                judge_src = "rules"
+                if eq is None:
+                    eq = _llm_judge_equivalence(
+                        llm=llm,
+                        uuid=uuid,
+                        question=q_raw,
+                        gold=gold,
+                        pred=pred_final,
+                        choice_map=choice_map,
+                        stage="stage2",
+                        sleep_s=sleep_s,
+                        stats=s2_judge_stats,
+                    )
+                    judge_src = "llm" if eq is not None else "unknown"
+                verdict = "正确" if eq is True else ("错误" if eq is False else "不确定")
+                if eq is True:
+                    ok2 += 1
+                stage2_attempts.append(
+                    {
+                        "raw_text": str(raw),
+                        "boxed_answer": boxed_i,
+                        "extracted_answer": extracted_final,
+                        "normalized_answer": pred_final,
+                        "verdict": verdict,
+                        "judge_source": judge_src,
+                    }
+                )
+
+            # Filter out empty answers (e.g. upstream LLM errors) to avoid false consensus.
+            vote_inputs2 = [str(a.get("normalized_answer") or "").strip() for a in stage2_attempts][:n2]
+            vote_inputs2 = [x for x in vote_inputs2 if x]
+            s2_vote = majority_vote(vote_inputs2)
+            stage2_majority_answer = {
+                "majority": s2_vote.majority,
+                "majority_count": int(s2_vote.majority_count),
+                "counts": dict(s2_vote.counts),
+            }
+            sel2 = _select_answer(gold=gold, majority=stage2_majority_answer, min_votes_to_accept=min_votes_to_accept)
+            final_answer2 = str(sel2.get("final_answer") or "").strip()
+            ok2_final = 0
+            for a in stage2_attempts:
+                boxed = a.get("boxed_answer")
+                boxed = boxed.strip() if isinstance(boxed, str) else str(boxed).strip()
+                if not boxed or not final_answer2:
+                    a["verdict"] = "不确定"
+                else:
+                    a["verdict"] = "正确" if (_as_choice_letter(boxed) == _as_choice_letter(final_answer2) or boxed == final_answer2) else "错误"
+                if a["verdict"] == "正确":
+                    ok2_final += 1
+
+            entry: Dict[str, Any] = {
+                "uuid": uuid,
+                "line_number": r.get("line_number"),
+                "stage": "stage2",
+                "difficulty": r.get("difficulty"),
+                "question": q_raw,
+                "gold": gold,
+                "model_input": model_q,
+                "raw_model_outputs": [str(x) for x in raw_model_outputs][:n2],
+                "extracted_answers": [str(x) for x in extracted_answers][:n2],
+                "majority_answer": stage2_majority_answer,
+                "attempts": stage2_attempts,
+                **sel2,
+                "ok": ok2_final,
+                "bad": n2 - ok2_final,
+                "llm_call_counts": {
+                    **(r.get("llm_call_counts") if isinstance(r.get("llm_call_counts"), dict) else {}),
+                    "stage2_judge_llm_fallback": sum(1 for a in stage2_attempts if a.get("judge_source") == "llm"),
+                    "stage2_judge_unknown": sum(1 for a in stage2_attempts if a.get("judge_source") == "unknown"),
+                    "stage2_judge_http_calls": int(s2_judge_stats.get("http_calls", 0)),
+                    "stage2_judge_retries": int(s2_judge_stats.get("retries", 0)),
+                    "stage2_judge_timeouts": int(s2_judge_stats.get("timeouts", 0)),
+                    "stage2_judge_errors": int(s2_judge_stats.get("errors", 0)),
+                },
+            }
+            # Keep a stage2 raw-generations file aligned with stage1_raw_generations:
+            # it captures multi-sample raw outputs + attempt judgments + voting stats (no stage3 routing).
+            raw_entry = dict(entry)
+            raw_entry.pop("final_answer", None)
+            raw_entry.pop("final_source", None)
+            raw_entry.pop("final_vote_count", None)
+            append_jsonl_line(stage2_raw_generations_path, raw_entry)
+            append_jsonl_line(stage2_archive_path, entry)
+
+            # Routing policy:
+            # If final_vote_count < min_votes_to_accept => go to next stage; else accepted.
+            try:
+                fv_i = int(sel2.get("final_vote_count") or 0)
+            except Exception:
+                fv_i = 0
+            next_stage = "stage3" if fv_i < int(min_votes_to_accept) else "accepted"
+            append_jsonl_line(
+                stage2_status_path,
+                {
+                    "uuid": uuid,
+                    "stage": "stage2",
+                    "ok": int(ok2),
+                    "bad": int(n2 - ok2),
+                    "min_votes_to_accept": int(min_votes_to_accept),
+                    "vote_majority": stage2_majority_answer.get("majority"),
+                    "vote_majority_count": int(stage2_majority_answer.get("majority_count", 0)),
+                    **_select_answer(gold=gold, majority=stage2_majority_answer, min_votes_to_accept=min_votes_to_accept),
+                    "next_stage": next_stage,
+                    "difficulty": r.get("difficulty"),
+                    "stage1_ok": r.get("stage1_ok"),
+                    "stage1_bad": r.get("stage1_bad"),
+                    "paths": {"infer": stage2_infer_path, "archive": stage2_archive_path},
+                },
+            )
+
+            if next_stage == "stage3":
+                stage3_inputs.append(
+                    {
+                        **{k: r.get(k) for k in CANONICAL_KEYS},
+                        "_difficulty": r.get("difficulty"),
+                        "_stage1_ok": r.get("stage1_ok"),
+                        "_stage1_bad": r.get("stage1_bad"),
+                    }
+                )
+
+        if stage3_inputs:
+            write_jsonl_atomic(stage3_input_path, stage3_inputs)
+        outs.append(stage2_status_path)
+
+    return outs
+
+
+def mode_stage3_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_to_accept: int, sleep_s: float) -> List[str]:
+    """
+    Route-A mode: stage3_infer
+    Input: stage3_input.stage3.jsonl (file) or directory containing *stage3_input.stage3.jsonl files.
+    Output: stage3/<prefix>.stage3_infer.stage3.jsonl
+    """
+    dirs = _ensure_stage_dirs(out_dir)
+    stage3_dir = dirs["stage3"]
+    outs: List[str] = []
+
+    for stage3_input_path in _iter_artifacts(input_arg, suffix="stage3_input.stage3.jsonl"):
+        prefix = _infer_prefix_from_artifact(stage3_input_path, suffix="stage3_input.stage3.jsonl")
+        pfx = f"{prefix}." if prefix else ""
+        stage3_infer_path = os.path.join(stage3_dir, f"{pfx}stage3_infer.stage3.jsonl")
+
+        infer_done: set[str] = set()
+        if os.path.exists(stage3_infer_path):
+            for rr in iter_jsonl(stage3_infer_path, tolerate_errors=True):
+                uu = rr.get("uuid")
+                if uu is not None:
+                    infer_done.add(str(uu))
+
+        for r in iter_jsonl(stage3_input_path, tolerate_errors=True):
+            uuid = r.get("uuid")
+            if uuid is None:
+                continue
+            uuid_key = str(uuid)
+            if uuid_key in infer_done:
+                continue
+            q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
+            gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
+            model_q = append_choice_map_if_any(normalize_for_model(q_raw))
+            choice_map = extract_choice_map(model_q)
+            s3_solve_stats: Dict[str, int] = {}
+            raw_solutions = llm.generate_n(
+                stage_name="stage3_solve",
+                question=model_q,
+                prompt_mode="boxed_solve",
+                sleep_s=sleep_s,
+                stats=s3_solve_stats,
+            )
+            n3 = int(llm.stage_params("stage3_solve").n)
+            extracted = [extract_final_answer(x) for x in raw_solutions]
+            standardized = [standardize_choice_answer(a, choice_map=choice_map) for a in extracted]
+            append_jsonl_line(
+                stage3_infer_path,
+                {
+                    "uuid": uuid,
+                    "line_number": r.get("line_number"),
+                    "stage": "stage3_infer",
+                    "difficulty": r.get("_difficulty"),
+                    "question": q_raw,
+                    "answer": gold,
+                    "gold": gold,
+                    "model_input": model_q,
+                    "raw_model_outputs": [str(x) for x in raw_solutions][:n3],
+                    "extracted_answers": [str(x) for x in standardized][:n3],
+                    "stage1_ok": r.get("_stage1_ok"),
+                    "stage1_bad": r.get("_stage1_bad"),
+                    "min_votes_to_accept": int(min_votes_to_accept),
+                    "llm_call_counts": {
+                        "stage3_solve": llm.stage_params("stage3_solve").n,
+                        "stage3_solve_http_calls": int(s3_solve_stats.get("http_calls", 0)),
+                        "stage3_solve_retries": int(s3_solve_stats.get("retries", 0)),
+                        "stage3_solve_timeouts": int(s3_solve_stats.get("timeouts", 0)),
+                        "stage3_solve_errors": int(s3_solve_stats.get("errors", 0)),
+                    },
+                },
+            )
+        outs.append(stage3_infer_path)
+    return outs
+
+
+def mode_stage3_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_to_accept: int, sleep_s: float) -> List[str]:
+    """
+    Route-A mode: stage3_eval
+    Input: stage3_infer.stage3.jsonl (file) or directory containing *stage3_infer.stage3.jsonl files.
+    Output: stage3/<prefix>.stage3_archive.stage3.jsonl + stage3/<prefix>.status.stage3.jsonl
+            accepted_bank + result (same conventions as the original pipeline)
+    """
+    dirs = _ensure_stage_dirs(out_dir)
+    stage3_dir = dirs["stage3"]
+    outs: List[str] = []
+
+    for stage3_infer_path in _iter_artifacts(input_arg, suffix="stage3_infer.stage3.jsonl"):
+        prefix = _infer_prefix_from_artifact(stage3_infer_path, suffix="stage3_infer.stage3.jsonl")
+        pfx = f"{prefix}." if prefix else ""
+        stage3_archive_path = os.path.join(stage3_dir, f"{pfx}stage3_archive.stage3.jsonl")
+        stage3_raw_generations_path = os.path.join(stage3_dir, f"{pfx}stage3_raw_generations.stage3.jsonl")
+        stage3_status_path = os.path.join(stage3_dir, f"{pfx}status.stage3.jsonl")
+
+        accepted_bank_path = os.path.join(out_dir, f"{pfx}accepted_bank.stage_final.jsonl")
+        result_dir = os.path.join(out_dir, "result")
+        os.makedirs(result_dir, exist_ok=True)
+        result_path = os.path.join(result_dir, f"{pfx}result.stage_final.jsonl")
+        try:
+            open(result_path, "a", encoding="utf-8").close()
+        except Exception:
+            pass
+
+        stage3_done = _load_status_map(stage3_status_path)
+        result_done: set[str] = set()
+        if os.path.exists(result_path):
+            for row in iter_jsonl(result_path, tolerate_errors=True):
+                u = row.get("uuid")
+                if u is not None:
+                    result_done.add(str(u))
+
+        for r in iter_jsonl(stage3_infer_path, tolerate_errors=True):
+            uuid = r.get("uuid")
+            if uuid is None:
+                continue
+            uuid_key = str(uuid)
+            if uuid_key in stage3_done:
+                continue
+            q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
+            gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
+            model_q = r.get("model_input") if isinstance(r.get("model_input"), str) else append_choice_map_if_any(normalize_for_model(q_raw))
+            choice_map = extract_choice_map(model_q)
+            raw_model_outputs = r.get("raw_model_outputs") if isinstance(r.get("raw_model_outputs"), list) else []
+            extracted_answers = r.get("extracted_answers") if isinstance(r.get("extracted_answers"), list) else []
+            n3 = int(llm.stage_params("stage3_solve").n)
+
+            stage3_attempts: List[Dict[str, Any]] = []
+            ok3 = 0
+            s3_judge_stats: Dict[str, int] = {}
+            for raw, pred_i in zip(raw_model_outputs[:n3], extracted_answers[:n3]):
+                boxed_i = extract_boxed_answer(str(raw))
+                extracted_final = boxed_i or str(pred_i)
+                pred_final = standardize_choice_answer(extracted_final, choice_map=choice_map)
+                eq = rule_equivalent(pred_final, gold, choice_map=choice_map)
+                judge_src = "rules"
+                if eq is None:
+                    eq = _llm_judge_equivalence(
+                        llm=llm,
+                        uuid=uuid,
+                        question=q_raw,
+                        gold=gold,
+                        pred=pred_final,
+                        choice_map=choice_map,
+                        stage="stage3",
+                        sleep_s=sleep_s,
+                        stats=s3_judge_stats,
+                    )
+                    judge_src = "llm" if eq is not None else "unknown"
+                verdict = "正确" if eq is True else ("错误" if eq is False else "不确定")
+                if eq is True:
+                    ok3 += 1
+                stage3_attempts.append(
+                    {
+                        "raw_text": str(raw),
+                        "boxed_answer": boxed_i,
+                        "extracted_answer": extracted_final,
+                        "normalized_answer": pred_final,
+                        "verdict": verdict,
+                        "judge_source": judge_src,
+                    }
+                )
+
+            # Filter out empty answers (e.g. upstream LLM errors) to avoid false consensus.
+            vote_inputs3 = [str(a.get("normalized_answer") or "").strip() for a in stage3_attempts][:n3]
+            vote_inputs3 = [x for x in vote_inputs3 if x]
+            s3_vote = majority_vote(vote_inputs3)
+            stage3_majority_answer = {
+                "majority": s3_vote.majority,
+                "majority_count": int(s3_vote.majority_count),
+                "counts": dict(s3_vote.counts),
+            }
+            sel3 = _select_answer(gold=gold, majority=stage3_majority_answer, min_votes_to_accept=min_votes_to_accept)
+            final_answer3 = str(sel3.get("final_answer") or "").strip()
+
+            ok3_final = 0
+            for a in stage3_attempts:
+                boxed = a.get("boxed_answer")
+                boxed = boxed.strip() if isinstance(boxed, str) else str(boxed).strip()
+                if not boxed or not final_answer3:
+                    a["verdict"] = "不确定"
+                else:
+                    a["verdict"] = "正确" if (_as_choice_letter(boxed) == _as_choice_letter(final_answer3) or boxed == final_answer3) else "错误"
+                if a["verdict"] == "正确":
+                    ok3_final += 1
+
+            entry = {
+                "uuid": uuid,
+                "line_number": r.get("line_number"),
+                "stage": "stage3",
+                "difficulty": r.get("difficulty"),
+                "question": q_raw,
+                "gold": gold,
+                "model_input": model_q,
+                "raw_model_outputs": [str(x) for x in raw_model_outputs][:n3],
+                "extracted_answers": [str(x) for x in extracted_answers][:n3],
+                "majority_answer": stage3_majority_answer,
+                "attempts": stage3_attempts,
+                **sel3,
+                "ok": ok3_final,
+                "bad": n3 - ok3_final,
+                "llm_call_counts": {
+                    **(r.get("llm_call_counts") if isinstance(r.get("llm_call_counts"), dict) else {}),
+                    "stage3_judge_llm_fallback": sum(1 for a in stage3_attempts if a.get("judge_source") == "llm"),
+                    "stage3_judge_unknown": sum(1 for a in stage3_attempts if a.get("judge_source") == "unknown"),
+                    "stage3_judge_http_calls": int(s3_judge_stats.get("http_calls", 0)),
+                    "stage3_judge_retries": int(s3_judge_stats.get("retries", 0)),
+                    "stage3_judge_timeouts": int(s3_judge_stats.get("timeouts", 0)),
+                    "stage3_judge_errors": int(s3_judge_stats.get("errors", 0)),
+                },
+            }
+
+            # Keep a stage3 raw-generations file aligned with stage1_raw_generations.
+            raw_entry = dict(entry)
+            raw_entry.pop("final_answer", None)
+            raw_entry.pop("final_source", None)
+            raw_entry.pop("final_vote_count", None)
+            append_jsonl_line(stage3_raw_generations_path, raw_entry)
+            append_jsonl_line(stage3_archive_path, entry)
+            accepted_from = "stage3" if sel3.get("final_source") == "majority" else "stage3_gold_fallback"
+            append_jsonl_line(accepted_bank_path, {**entry, **sel3, "accepted_from": accepted_from})
+            if sel3.get("final_source") == "majority" and uuid_key not in result_done:
+                append_jsonl_line(result_path, _to_result_entry(stage="stage3", final_answer=str(sel3.get("final_answer") or ""), entry=entry))
+                result_done.add(uuid_key)
+            append_jsonl_line(
+                stage3_status_path,
+                {
+                    "uuid": uuid,
+                    "stage": "stage3",
+                    "ok": int(ok3),
+                    "bad": int(n3 - ok3),
+                    "min_votes_to_accept": int(min_votes_to_accept),
+                    "vote_majority": stage3_majority_answer.get("majority"),
+                    "vote_majority_count": int(stage3_majority_answer.get("majority_count", 0)),
+                    **sel3,
+                    "next_stage": "accepted",
+                    "difficulty": r.get("difficulty"),
+                    "stage1_ok": r.get("stage1_ok"),
+                    "stage1_bad": r.get("stage1_bad"),
+                    "paths": {"infer": stage3_infer_path, "archive": stage3_archive_path, "result": result_path},
+                },
+            )
+
+        outs.append(stage3_status_path)
+
+    return outs
+
+
 def _run_one_input(
     *,
     input_path: str,
@@ -137,9 +1126,11 @@ def _run_one_input(
     stage1_status_path = os.path.join(stage1_dir, f"{pfx}status.stage1.jsonl")
 
     stage2_archive_path = os.path.join(stage2_dir, f"{pfx}stage2_archive.stage2.jsonl")
+    stage2_raw_generations_path = os.path.join(stage2_dir, f"{pfx}stage2_raw_generations.stage2.jsonl")
     stage2_status_path = os.path.join(stage2_dir, f"{pfx}status.stage2.jsonl")
 
     stage3_archive_path = os.path.join(stage3_dir, f"{pfx}stage3_archive.stage3.jsonl")
+    stage3_raw_generations_path = os.path.join(stage3_dir, f"{pfx}stage3_raw_generations.stage3.jsonl")
     stage3_status_path = os.path.join(stage3_dir, f"{pfx}status.stage3.jsonl")
 
     accepted_bank_path = os.path.join(out_dir, f"{pfx}accepted_bank.stage_final.jsonl")
@@ -716,7 +1707,10 @@ def _run_one_input(
             )
 
         # Majority vote uses the same "boxed-first, then normalize" answers we judge with.
-        s2_vote = majority_vote([str(a.get("normalized_answer") or "") for a in stage2_attempts][:n2])
+        # Filter out empty answers (e.g. upstream LLM errors) to avoid false consensus.
+        vote_inputs2 = [str(a.get("normalized_answer") or "").strip() for a in stage2_attempts][:n2]
+        vote_inputs2 = [x for x in vote_inputs2 if x]
+        s2_vote = majority_vote(vote_inputs2)
         stage2_majority_answer = {
             "majority": s2_vote.majority,
             "majority_count": int(s2_vote.majority_count),
@@ -743,7 +1737,6 @@ def _run_one_input(
             "stage": "stage2",
             "difficulty": r.get("_difficulty"),
             "question": q_raw,
-            "answer": gold,
             "gold": gold,
             "model_input": model_q,
             "raw_model_outputs": [str(x) for x in raw_solutions][:n2],
@@ -768,6 +1761,11 @@ def _run_one_input(
             },
         }
 
+        raw_entry = dict(entry)
+        raw_entry.pop("final_answer", None)
+        raw_entry.pop("final_source", None)
+        raw_entry.pop("final_vote_count", None)
+        append_jsonl_line(stage2_raw_generations_path, raw_entry)
         append_jsonl_line(stage2_archive_path, entry)
         # Routing uses vote strength (consensus), not reference-accuracy ok/bad.
         next_stage = "stage3" if int(stage2_majority_answer["majority_count"]) < int(min_votes_to_accept) else "accepted"
@@ -865,7 +1863,10 @@ def _run_one_input(
             )
 
         # Majority vote uses the same "boxed-first, then normalize" answers we judge with.
-        s3_vote = majority_vote([str(a.get("normalized_answer") or "") for a in stage3_attempts][:n3])
+        # Filter out empty answers (e.g. upstream LLM errors) to avoid false consensus.
+        vote_inputs3 = [str(a.get("normalized_answer") or "").strip() for a in stage3_attempts][:n3]
+        vote_inputs3 = [x for x in vote_inputs3 if x]
+        s3_vote = majority_vote(vote_inputs3)
         stage3_majority_answer = {
             "majority": s3_vote.majority,
             "majority_count": int(s3_vote.majority_count),
@@ -891,7 +1892,6 @@ def _run_one_input(
             "stage": "stage3",
             "difficulty": r.get("_difficulty"),
             "question": q_raw,
-            "answer": gold,
             "gold": gold,
             "model_input": model_q,
             "raw_model_outputs": [str(x) for x in raw_solutions][:n3],
@@ -916,6 +1916,11 @@ def _run_one_input(
             },
         }
 
+        raw_entry = dict(entry)
+        raw_entry.pop("final_answer", None)
+        raw_entry.pop("final_source", None)
+        raw_entry.pop("final_vote_count", None)
+        append_jsonl_line(stage3_raw_generations_path, raw_entry)
         append_jsonl_line(stage3_archive_path, entry)
         # Finalization rule:
         # - If vote has consensus: accept by vote
@@ -960,6 +1965,19 @@ def _run_one_input(
 
 def main() -> None:
     p = argparse.ArgumentParser(description="MathAgent minimal pipeline (JSONL between stages).")
+    p.add_argument(
+        "--mode",
+        default="full",
+        choices=MODES,
+        help=(
+            "Execution mode. 'full' runs the original pipeline.\n"
+            "Route-A modular modes:\n"
+            "  - stage2_infer: input is stage1_output.stage1.jsonl (or a dir of them) -> emit stage2_infer\n"
+            "  - stage2_eval: input is stage2_infer.stage2.jsonl (or a dir of them) -> emit stage2 status + stage3_input\n"
+            "  - stage3_infer: input is stage3_input.stage3.jsonl (or a dir of them) -> emit stage3_infer\n"
+            "  - stage3_eval: input is stage3_infer.stage3.jsonl (or a dir of them) -> emit stage3 status + result"
+        ),
+    )
     p.add_argument("--input", default=None, help="Input JSONL file path OR a directory containing JSONL files.")
     p.add_argument(
         "--stage1",
@@ -977,10 +1995,17 @@ def main() -> None:
 
     os.makedirs(args.out, exist_ok=True)
 
-    if not args.input and not args.stage1:
-        raise ValueError("Must provide either --input or --stage1")
-    if args.input and args.stage1:
-        raise ValueError("Provide only one of --input or --stage1 (not both)")
+    mode = str(args.mode or "full").strip()
+    if mode != "full":
+        if not args.input:
+            raise ValueError("--mode is not 'full': must provide --input as the artifact path (file or directory).")
+        if args.stage1:
+            raise ValueError("--mode is not 'full': do not use --stage1; provide --input pointing to artifacts instead.")
+    else:
+        if not args.input and not args.stage1:
+            raise ValueError("Must provide either --input or --stage1")
+        if args.input and args.stage1:
+            raise ValueError("Provide only one of --input or --stage1 (not both)")
 
     stage1_dir = os.path.join(args.out, "stage1") if not args.stage1 else str(args.stage1)
     stage2_dir = os.path.join(args.out, "stage2")
@@ -993,6 +2018,68 @@ def main() -> None:
 
     llm = LLMRouter(config_path=args.llm_config)
     min_votes_to_accept = llm.threshold_int("min_votes_to_accept", 5)
+
+    # ---- Route-A modular modes ----
+    if mode != "full":
+        assert args.input
+        if mode == "stage1_infer":
+            outs = mode_stage1_infer(
+                input_arg=args.input,
+                out_dir=args.out,
+                llm=llm,
+                min_votes_to_accept=min_votes_to_accept,
+                sleep_s=float(args.sleep),
+            )
+        elif mode == "stage1_eval":
+            outs = mode_stage1_eval(
+                input_arg=args.input,
+                out_dir=args.out,
+                llm=llm,
+                min_votes_to_accept=min_votes_to_accept,
+                sleep_s=float(args.sleep),
+            )
+        elif mode == "stage2_infer":
+            outs = mode_stage2_infer(
+                input_arg=args.input,
+                out_dir=args.out,
+                llm=llm,
+                min_votes_to_accept=min_votes_to_accept,
+                sleep_s=float(args.sleep),
+            )
+        elif mode == "stage2_eval":
+            outs = mode_stage2_eval(
+                input_arg=args.input,
+                out_dir=args.out,
+                llm=llm,
+                min_votes_to_accept=min_votes_to_accept,
+                sleep_s=float(args.sleep),
+            )
+        elif mode == "stage3_infer":
+            outs = mode_stage3_infer(
+                input_arg=args.input,
+                out_dir=args.out,
+                llm=llm,
+                min_votes_to_accept=min_votes_to_accept,
+                sleep_s=float(args.sleep),
+            )
+        elif mode == "stage3_eval":
+            outs = mode_stage3_eval(
+                input_arg=args.input,
+                out_dir=args.out,
+                llm=llm,
+                min_votes_to_accept=min_votes_to_accept,
+                sleep_s=float(args.sleep),
+            )
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        print("Done.")
+        print(f"- mode: {mode}")
+        print(f"- input: {args.input}")
+        print(f"- out_dir: {args.out}")
+        for pth in outs:
+            print(f"- output: {pth}")
+        return
 
     # Stage1-dir input mode: run Stage2/Stage3 using existing Stage1 artifacts.
     if args.stage1:

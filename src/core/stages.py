@@ -91,6 +91,10 @@ def extract_final_answer(text: str) -> str:
     s = strip_think(text)
     if not s:
         return ""
+    # Defensive: if upstream returned an error marker, do not accidentally extract numbers
+    # (e.g. HTTP 503) as a "final answer".
+    if s.strip().startswith("[LLM_ERROR"):
+        return ""
 
     m_box = _BOXED_ANS_RE.search(s)
     if m_box:
