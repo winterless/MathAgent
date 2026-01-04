@@ -57,7 +57,10 @@ PYTHONPATH=src python3 src/run_pipeline.py \
 Note: `stage1_infer` expects **raw input JSONL**. If you pass an `--out` root directory as `--input`,
 it will only work when that directory already contains `*.stage0.jsonl` copies of the original inputs.
 
-Stage1 eval (consume `stage1_infer` and produce `stage1_output` + `status.stage1` + `stage2_input`):
+Stage1 eval (prefer consuming existing `stage1_output` and produce `status.stage1` + `stage2_input`):
+  - It first parses boxed counts from `stage1_output.output` (no LLM needed): `\\boxed{解答正确：x，解答错误：y}`
+  - Only when parsing fails will it best-effort call LLM to re-produce boxed counts
+  - Backward compat: if no `stage1_output` is found, it will fall back to consuming `stage1_infer` and generating `stage1_output`
 
 ```bash
 PYTHONPATH=src python3 src/run_pipeline.py \

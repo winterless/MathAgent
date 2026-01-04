@@ -464,8 +464,13 @@ def mode_stage1_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
 def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_to_accept: int, sleep_s: float) -> List[str]:
     """
     Route-A mode: stage1_eval
-    Input: stage1_infer.stage1.jsonl (file) or directory containing *stage1_infer.stage1.jsonl.
-    Output: stage1/<prefix>.stage1_output.stage1.jsonl + stage1/<prefix>.status.stage1.jsonl
+    Input (preferred): stage1_output.stage1.jsonl (file) or directory/out-root containing *stage1_output.stage1.jsonl.
+        - stage1_eval will first try to parse boxed counts from existing output content:
+          \\boxed{解答正确：x，解答错误：y}
+        - Only when parsing fails will it fall back to an LLM eval call (best-effort), using the stored `prompt`
+          plus [GOLD_STANDARD_ANSWER]=... as input.
+        - Backward-compat: if no stage1_output artifacts are found, we fall back to stage1_infer.stage1.jsonl logic.
+    Output: stage1/<prefix>.status.stage1.jsonl
             stage2/<prefix>.stage2_input.stage2.jsonl (for stage2_infer, optional convenience)
     """
     dirs = _ensure_stage_dirs(out_dir)
@@ -473,14 +478,27 @@ def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
     stage2_dir = dirs["stage2"]
 
     outs: List[str] = []
-    infer_paths = _iter_artifacts(input_arg, suffix="stage1_infer.stage1.jsonl")
-    multi = os.path.isdir(input_arg) and len(infer_paths) > 1
+    # Prefer stage1_output-based routing (no LLM required). If absent, fall back to stage1_infer-based evaluation.
+    artifact_paths: List[str] = []
+    if os.path.isdir(input_arg):
+        artifact_paths = _iter_artifacts(input_arg, suffix="stage1_output.stage1.jsonl")
+        if not artifact_paths:
+            artifact_paths = _iter_artifacts(input_arg, suffix="stage1_infer.stage1.jsonl")
+    else:
+        artifact_paths = [input_arg]
+
+    is_output_mode = True
+    if artifact_paths:
+        base0 = os.path.basename(artifact_paths[0])
+        is_output_mode = base0.endswith("stage1_output.stage1.jsonl")
+
+    multi = os.path.isdir(input_arg) and len(artifact_paths) > 1 and is_output_mode
     overall: _UUIDProgress | None = None
     if multi:
         total_all = 0
         done_all = 0
-        for p in infer_paths:
-            prefix = _infer_prefix_from_artifact(p, suffix="stage1_infer.stage1.jsonl")
+        for p in artifact_paths:
+            prefix = _infer_prefix_from_artifact(p, suffix="stage1_output.stage1.jsonl")
             pfx = f"{prefix}." if prefix else ""
             stage1_status_path = os.path.join(dirs["stage1"], f"{pfx}status.stage1.jsonl")
             done_map = _load_status_map(stage1_status_path)
@@ -494,192 +512,335 @@ def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
         overall = _UUIDProgress(label="stage1_eval", total=total_all, already_done=done_all, prefix="ALL")
         overall.start()
 
-    for stage1_infer_path in infer_paths:
-        prefix = _infer_prefix_from_artifact(stage1_infer_path, suffix="stage1_infer.stage1.jsonl")
-        pfx = f"{prefix}." if prefix else ""
-        stage1_output_path = os.path.join(stage1_dir, f"{pfx}stage1_output.stage1.jsonl")
-        stage1_raw_generations_path = os.path.join(stage1_dir, f"{pfx}stage1_raw_generations.stage1.jsonl")
-        stage1_status_path = os.path.join(stage1_dir, f"{pfx}status.stage1.jsonl")
-        stage2_input_path = os.path.join(stage2_dir, f"{pfx}stage2_input.stage2.jsonl")
+    for in_path in artifact_paths:
+        base = os.path.basename(in_path)
+        if base.endswith("stage1_output.stage1.jsonl"):
+            # ---- Preferred: parse counts from existing stage1_output.output ----
+            prefix = _infer_prefix_from_artifact(in_path, suffix="stage1_output.stage1.jsonl")
+            pfx = f"{prefix}." if prefix else ""
+            stage1_output_path = in_path
+            stage1_status_path = os.path.join(stage1_dir, f"{pfx}status.stage1.jsonl")
+            stage2_input_path = os.path.join(stage2_dir, f"{pfx}stage2_input.stage2.jsonl")
+            stage1_raw_generations_path = os.path.join(stage1_dir, f"{pfx}stage1_raw_generations.stage1.jsonl")
 
-        stage1_done = _load_status_map(stage1_status_path)
-        stage2_inputs: List[Dict[str, Any]] = []
+            stage1_done = _load_status_map(stage1_status_path)
+            stage2_inputs: List[Dict[str, Any]] = []
 
-        all_rows: List[Dict[str, Any]] = []
-        for r in iter_jsonl(stage1_infer_path, tolerate_errors=True):
-            uuid = r.get("uuid")
-            if uuid is None:
-                continue
-            uuid_key = str(uuid)
-            all_rows.append(r)
+            # Optional: if stage1_raw_generations exists, use it to populate final_answer/final_vote_count.
+            raw_stage1_by_uuid: Dict[str, Dict[str, Any]] = {}
+            if os.path.exists(stage1_raw_generations_path):
+                for rr in iter_jsonl(stage1_raw_generations_path, tolerate_errors=True):
+                    u0 = rr.get("uuid")
+                    if u0 is not None and isinstance(rr, dict):
+                        raw_stage1_by_uuid[str(u0)] = rr
 
-        to_process = [r for r in all_rows if str(r.get("uuid")) not in stage1_done]
-        prog: _UUIDProgress | None = None
-        if not multi:
-            prog = _UUIDProgress(label="stage1_eval", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
-            prog.start()
+            all_rows: List[Dict[str, Any]] = []
+            for r in iter_jsonl(stage1_output_path, tolerate_errors=True):
+                uuid = r.get("uuid")
+                if uuid is None:
+                    continue
+                all_rows.append(r)
 
-        for r in to_process:
-            t0 = time.monotonic()
-            uuid = r.get("uuid")
-            uuid_key = str(uuid)
+            to_process = [r for r in all_rows if str(r.get("uuid")) not in stage1_done]
+            prog: _UUIDProgress | None = None
+            if not multi:
+                prog = _UUIDProgress(label="stage1_eval", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
+                prog.start()
 
-            q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
-            gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
-            model_q = r.get("model_input") if isinstance(r.get("model_input"), str) else append_choice_map_if_any(normalize_for_model(q_raw))
-            choice_map = extract_choice_map(model_q)
-            raw_model_outputs = r.get("raw_model_outputs") if isinstance(r.get("raw_model_outputs"), list) else []
-            extracted_answers = r.get("extracted_answers") if isinstance(r.get("extracted_answers"), list) else []
-            majority_answer_json = r.get("majority_answer") if isinstance(r.get("majority_answer"), dict) else {"majority": "", "majority_count": 0, "counts": {}}
-            n1 = int(llm.stage_params("stage1_solve").n)
+            for r in to_process:
+                t0 = time.monotonic()
+                uuid = r.get("uuid")
+                uuid_key = str(uuid)
 
-            # Judge attempts (rule first, optional LLM judge).
-            stage1_attempts: List[Dict[str, Any]] = []
-            ok1 = 0
-            s1_judge_stats: Dict[str, int] = {}
-            for raw, pred_i in zip(raw_model_outputs[:n1], extracted_answers[:n1]):
-                boxed_i = extract_boxed_answer(str(raw))
-                extracted_final = boxed_i or str(pred_i)
-                pred_final = standardize_choice_answer(extracted_final, choice_map=choice_map)
-                eq = rule_equivalent(pred_final, gold, choice_map=choice_map)
-                judge_src = "rules"
-                if eq is None:
-                    eq = _llm_judge_equivalence(
-                        llm=llm,
-                        uuid=uuid,
-                        question=q_raw,
-                        gold=gold,
-                        pred=pred_final,
-                        choice_map=choice_map,
-                        stage="stage1",
-                        sleep_s=sleep_s,
-                        stats=s1_judge_stats,
+                q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
+                gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
+
+                # 1) Prefer parsing boxed counts from existing output (no LLM).
+                counts = extract_boxed_counts_from_output(r.get("output"))
+                eval_calls = 0
+                eval_text = ""
+                s1_eval_stats: Dict[str, int] = {}
+
+                # 2) Only if parsing failed, do best-effort LLM fallback using stored prompt + gold.
+                if counts is None:
+                    stored_prompt = r.get("prompt") if isinstance(r.get("prompt"), str) else ""
+                    if stored_prompt and gold:
+                        eval_user = f"{stored_prompt}\n\n[GOLD_STANDARD_ANSWER]={gold}\n"
+                        for _ in range(2):
+                            eval_calls += 1
+                            eval_text = llm.generate_n(
+                                stage_name="stage1_eval",
+                                question=eval_user,
+                                prompt_mode="raw_prompt_eval",
+                                sleep_s=sleep_s,
+                                stats=s1_eval_stats,
+                            )[0]
+                            eval_text = strip_think(eval_text)
+                            if extract_boxed_counts(eval_text) is not None:
+                                break
+                        counts = extract_boxed_counts(eval_text)
+
+                # Routing decision derived from parsed boxed counts:
+                # - accept iff ok >= min_votes_to_accept
+                # - otherwise go to stage2
+                if counts is not None:
+                    ok_i, bad_i = int(counts[0]), int(counts[1])
+                else:
+                    ok_i, bad_i = 0, 0
+                next_stage = "accepted" if ok_i >= int(min_votes_to_accept) else "stage2"
+
+                # Populate final_answer/final_vote_count if raw generations exist; otherwise conservative fallback.
+                raw_stage1 = raw_stage1_by_uuid.get(uuid_key, {})
+                maj = raw_stage1.get("majority_answer") if isinstance(raw_stage1.get("majority_answer"), dict) else None
+                if isinstance(maj, dict) and maj.get("majority_count") is not None:
+                    sel1 = _select_answer(gold=gold, majority=maj, min_votes_to_accept=min_votes_to_accept)
+                    vote_majority = maj.get("majority")
+                    vote_majority_count = int(maj.get("majority_count", 0) or 0)
+                else:
+                    sel1 = {"final_answer": gold, "final_source": "answer_fallback", "final_vote_count": int(ok_i)}
+                    vote_majority = None
+                    vote_majority_count = 0
+
+                append_jsonl_line(
+                    stage1_status_path,
+                    {
+                        "uuid": uuid,
+                        "stage": "stage1",
+                        "ok": int(ok_i),
+                        "bad": int(bad_i),
+                        "eval_ok": int(ok_i) if counts is not None else None,
+                        "eval_bad": int(bad_i) if counts is not None else None,
+                        "judge_ok": raw_stage1.get("ok") if isinstance(raw_stage1, dict) else None,
+                        "judge_bad": raw_stage1.get("bad") if isinstance(raw_stage1, dict) else None,
+                        "min_votes_to_accept": int(min_votes_to_accept),
+                        "vote_majority": vote_majority,
+                        "vote_majority_count": int(vote_majority_count),
+                        **sel1,
+                        "next_stage": next_stage,
+                        "paths": {"raw_generations": stage1_raw_generations_path, "output": stage1_output_path},
+                        "llm_call_counts": {
+                            "stage1_eval": int(eval_calls),
+                            "stage1_eval_http_calls": int(s1_eval_stats.get("http_calls", 0)),
+                            "stage1_eval_retries": int(s1_eval_stats.get("retries", 0)),
+                            "stage1_eval_timeouts": int(s1_eval_stats.get("timeouts", 0)),
+                            "stage1_eval_errors": int(s1_eval_stats.get("errors", 0)),
+                        }
+                        if eval_calls > 0
+                        else {"stage1_eval": 0},
+                    },
+                )
+                stage1_done[uuid_key] = {"uuid": uuid, "ok": int(ok_i), "bad": int(bad_i), "next_stage": next_stage}
+
+                if next_stage == "stage2":
+                    stage2_inputs.append(
+                        {
+                            **{k: r.get(k) for k in CANONICAL_KEYS},
+                            "_stage1_ok": int(ok_i),
+                            "_stage1_bad": int(bad_i),
+                            "_difficulty": int(bad_i),
+                        }
                     )
-                    judge_src = "llm" if eq is not None else "unknown"
-                verdict = "正确" if eq is True else ("错误" if eq is False else "不确定")
-                if eq is True:
-                    ok1 += 1
-                stage1_attempts.append(
-                    {
-                        "raw_text": str(raw),
-                        "boxed_answer": boxed_i,
-                        "extracted_answer": extracted_final,
-                        "normalized_answer": pred_final,
-                        "verdict": verdict,
-                        "judge_source": judge_src,
-                    }
-                )
 
-            stored_prompt = assemble_stored_prompt(
-                question=q_raw,
-                standard_answer="",
-                stage1_answers=[str(x) for x in extracted_answers][:n1],
-            )
+                dt = time.monotonic() - t0
+                if prog is not None:
+                    prog.tick(dt)
+                if overall is not None:
+                    overall.tick(dt)
 
-            # Eval prompt (must end with boxed counts ideally).
-            eval_user = f"{stored_prompt}\n\n[GOLD_STANDARD_ANSWER]={gold}\n"
-            eval_calls = 0
-            eval_text = ""
-            s1_eval_stats: Dict[str, int] = {}
-            for _ in range(2):
-                eval_calls += 1
-                eval_text = llm.generate_n(
-                    stage_name="stage1_eval",
-                    question=eval_user,
-                    prompt_mode="raw_prompt_eval",
-                    sleep_s=sleep_s,
-                    stats=s1_eval_stats,
-                )[0]
-                eval_text = strip_think(eval_text)
-                if extract_boxed_counts(eval_text) is not None:
-                    break
-
-            stage1_raw_entry: Dict[str, Any] = {
-                "uuid": uuid,
-                "line_number": r.get("line_number"),
-                "stage": "stage1",
-                "question": q_raw,
-                "gold": gold,
-                "model_input": model_q,
-                "raw_model_outputs": [str(x) for x in raw_model_outputs][:n1],
-                "extracted_answers": [str(x) for x in extracted_answers][:n1],
-                "majority_answer": majority_answer_json,
-                "attempts": stage1_attempts,
-                "ok": ok1,
-                "bad": n1 - ok1,
-                "llm_call_counts": {
-                    **(r.get("llm_call_counts") if isinstance(r.get("llm_call_counts"), dict) else {}),
-                    "stage1_eval": eval_calls,
-                    "stage1_eval_http_calls": int(s1_eval_stats.get("http_calls", 0)),
-                    "stage1_eval_retries": int(s1_eval_stats.get("retries", 0)),
-                    "stage1_eval_timeouts": int(s1_eval_stats.get("timeouts", 0)),
-                    "stage1_eval_errors": int(s1_eval_stats.get("errors", 0)),
-                    "stage1_judge_llm_fallback": sum(1 for a in stage1_attempts if a.get("judge_source") == "llm"),
-                    "stage1_judge_unknown": sum(1 for a in stage1_attempts if a.get("judge_source") == "unknown"),
-                    "stage1_judge_http_calls": int(s1_judge_stats.get("http_calls", 0)),
-                    "stage1_judge_retries": int(s1_judge_stats.get("retries", 0)),
-                    "stage1_judge_timeouts": int(s1_judge_stats.get("timeouts", 0)),
-                    "stage1_judge_errors": int(s1_judge_stats.get("errors", 0)),
-                },
-            }
-
-            out = normalize_output_wrapper(
-                {"status": "SUCCESS", "content": {"choices": [{"indext": 0, "message": {"role": "assistant", "content": eval_text}}]}},
-                uuid=uuid,
-                stage="stage1",
-            )
-            clean = {k: r.get(k) for k in CANONICAL_KEYS}
-            clean["prompt"] = stored_prompt
-            clean["output"] = out
-
-            append_jsonl_line(stage1_raw_generations_path, stage1_raw_entry)
-            append_jsonl_line(stage1_output_path, clean)
-
-            counts = extract_boxed_counts(eval_text)
-            route_ok, route_bad = (counts if counts is not None else (ok1, n1 - ok1))
-            sel1 = _select_answer(gold=gold, majority=majority_answer_json, min_votes_to_accept=min_votes_to_accept)
-            next_stage = "stage2" if int(majority_answer_json.get("majority_count", 0)) < int(min_votes_to_accept) else "accepted"
-            append_jsonl_line(
-                stage1_status_path,
-                {
-                    "uuid": uuid,
-                    "stage": "stage1",
-                    "ok": int(route_ok),
-                    "bad": int(route_bad),
-                    "eval_ok": int(counts[0]) if counts is not None else None,
-                    "eval_bad": int(counts[1]) if counts is not None else None,
-                    "judge_ok": int(ok1),
-                    "judge_bad": int(n1 - ok1),
-                    "min_votes_to_accept": int(min_votes_to_accept),
-                    "vote_majority": majority_answer_json.get("majority"),
-                    "vote_majority_count": int(majority_answer_json.get("majority_count", 0)),
-                    **sel1,
-                    "next_stage": next_stage,
-                    "paths": {"infer": stage1_infer_path, "raw_generations": stage1_raw_generations_path, "output": stage1_output_path},
-                },
-            )
-            stage1_done[uuid_key] = {"uuid": uuid, "ok": int(route_ok), "bad": int(route_bad), "next_stage": next_stage}
-
-            if next_stage == "stage2":
-                stage2_inputs.append(
-                    {
-                        **{k: r.get(k) for k in CANONICAL_KEYS},
-                        "_stage1_ok": int(route_ok),
-                        "_stage1_bad": int(route_bad),
-                        "_difficulty": int(route_bad),
-                    }
-                )
-            dt = time.monotonic() - t0
+            if stage2_inputs:
+                write_jsonl_atomic(stage2_input_path, stage2_inputs)
+            outs.append(stage1_status_path)
             if prog is not None:
-                prog.tick(dt)
-            if overall is not None:
-                overall.tick(dt)
+                prog.finish()
+        else:
+            # ---- Backward compat: old behavior (stage1_infer-based) ----
+            stage1_infer_path = in_path
+            prefix = _infer_prefix_from_artifact(stage1_infer_path, suffix="stage1_infer.stage1.jsonl")
+            pfx = f"{prefix}." if prefix else ""
+            stage1_output_path = os.path.join(stage1_dir, f"{pfx}stage1_output.stage1.jsonl")
+            stage1_raw_generations_path = os.path.join(stage1_dir, f"{pfx}stage1_raw_generations.stage1.jsonl")
+            stage1_status_path = os.path.join(stage1_dir, f"{pfx}status.stage1.jsonl")
+            stage2_input_path = os.path.join(stage2_dir, f"{pfx}stage2_input.stage2.jsonl")
 
-        if stage2_inputs:
-            write_jsonl_atomic(stage2_input_path, stage2_inputs)
-        outs.append(stage1_status_path)
-        if prog is not None:
-            prog.finish()
+            stage1_done = _load_status_map(stage1_status_path)
+            stage2_inputs: List[Dict[str, Any]] = []
+
+            all_rows: List[Dict[str, Any]] = []
+            for r in iter_jsonl(stage1_infer_path, tolerate_errors=True):
+                uuid = r.get("uuid")
+                if uuid is None:
+                    continue
+                all_rows.append(r)
+
+            to_process = [r for r in all_rows if str(r.get("uuid")) not in stage1_done]
+            prog: _UUIDProgress | None = None
+            if not multi:
+                prog = _UUIDProgress(label="stage1_eval", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
+                prog.start()
+
+            for r in to_process:
+                t0 = time.monotonic()
+                uuid = r.get("uuid")
+                uuid_key = str(uuid)
+
+                q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
+                gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
+                model_q = r.get("model_input") if isinstance(r.get("model_input"), str) else append_choice_map_if_any(normalize_for_model(q_raw))
+                choice_map = extract_choice_map(model_q)
+                raw_model_outputs = r.get("raw_model_outputs") if isinstance(r.get("raw_model_outputs"), list) else []
+                extracted_answers = r.get("extracted_answers") if isinstance(r.get("extracted_answers"), list) else []
+                majority_answer_json = (
+                    r.get("majority_answer") if isinstance(r.get("majority_answer"), dict) else {"majority": "", "majority_count": 0, "counts": {}}
+                )
+                n1 = int(llm.stage_params("stage1_solve").n)
+
+                # Judge attempts (rule first, optional LLM judge).
+                stage1_attempts: List[Dict[str, Any]] = []
+                ok1 = 0
+                s1_judge_stats: Dict[str, int] = {}
+                for raw, pred_i in zip(raw_model_outputs[:n1], extracted_answers[:n1]):
+                    boxed_i = extract_boxed_answer(str(raw))
+                    extracted_final = boxed_i or str(pred_i)
+                    pred_final = standardize_choice_answer(extracted_final, choice_map=choice_map)
+                    eq = rule_equivalent(pred_final, gold, choice_map=choice_map)
+                    judge_src = "rules"
+                    if eq is None:
+                        eq = _llm_judge_equivalence(
+                            llm=llm,
+                            uuid=uuid,
+                            question=q_raw,
+                            gold=gold,
+                            pred=pred_final,
+                            choice_map=choice_map,
+                            stage="stage1",
+                            sleep_s=sleep_s,
+                            stats=s1_judge_stats,
+                        )
+                        judge_src = "llm" if eq is not None else "unknown"
+                    verdict = "正确" if eq is True else ("错误" if eq is False else "不确定")
+                    if eq is True:
+                        ok1 += 1
+                    stage1_attempts.append(
+                        {
+                            "raw_text": str(raw),
+                            "boxed_answer": boxed_i,
+                            "extracted_answer": extracted_final,
+                            "normalized_answer": pred_final,
+                            "verdict": verdict,
+                            "judge_source": judge_src,
+                        }
+                    )
+
+                stored_prompt = assemble_stored_prompt(
+                    question=q_raw,
+                    standard_answer="",
+                    stage1_answers=[str(x) for x in extracted_answers][:n1],
+                )
+
+                # Eval prompt (must end with boxed counts ideally).
+                eval_user = f"{stored_prompt}\n\n[GOLD_STANDARD_ANSWER]={gold}\n"
+                eval_calls = 0
+                eval_text = ""
+                s1_eval_stats: Dict[str, int] = {}
+                for _ in range(2):
+                    eval_calls += 1
+                    eval_text = llm.generate_n(
+                        stage_name="stage1_eval",
+                        question=eval_user,
+                        prompt_mode="raw_prompt_eval",
+                        sleep_s=sleep_s,
+                        stats=s1_eval_stats,
+                    )[0]
+                    eval_text = strip_think(eval_text)
+                    if extract_boxed_counts(eval_text) is not None:
+                        break
+
+                stage1_raw_entry: Dict[str, Any] = {
+                    "uuid": uuid,
+                    "line_number": r.get("line_number"),
+                    "stage": "stage1",
+                    "question": q_raw,
+                    "gold": gold,
+                    "model_input": model_q,
+                    "raw_model_outputs": [str(x) for x in raw_model_outputs][:n1],
+                    "extracted_answers": [str(x) for x in extracted_answers][:n1],
+                    "majority_answer": majority_answer_json,
+                    "attempts": stage1_attempts,
+                    "ok": ok1,
+                    "bad": n1 - ok1,
+                    "llm_call_counts": {
+                        **(r.get("llm_call_counts") if isinstance(r.get("llm_call_counts"), dict) else {}),
+                        "stage1_eval": eval_calls,
+                        "stage1_eval_http_calls": int(s1_eval_stats.get("http_calls", 0)),
+                        "stage1_eval_retries": int(s1_eval_stats.get("retries", 0)),
+                        "stage1_eval_timeouts": int(s1_eval_stats.get("timeouts", 0)),
+                        "stage1_eval_errors": int(s1_eval_stats.get("errors", 0)),
+                        "stage1_judge_llm_fallback": sum(1 for a in stage1_attempts if a.get("judge_source") == "llm"),
+                        "stage1_judge_unknown": sum(1 for a in stage1_attempts if a.get("judge_source") == "unknown"),
+                        "stage1_judge_http_calls": int(s1_judge_stats.get("http_calls", 0)),
+                        "stage1_judge_retries": int(s1_judge_stats.get("retries", 0)),
+                        "stage1_judge_timeouts": int(s1_judge_stats.get("timeouts", 0)),
+                        "stage1_judge_errors": int(s1_judge_stats.get("errors", 0)),
+                    },
+                }
+
+                out = normalize_output_wrapper(
+                    {"status": "SUCCESS", "content": {"choices": [{"indext": 0, "message": {"role": "assistant", "content": eval_text}}]}},
+                    uuid=uuid,
+                    stage="stage1",
+                )
+                clean = {k: r.get(k) for k in CANONICAL_KEYS}
+                clean["prompt"] = stored_prompt
+                clean["output"] = out
+
+                append_jsonl_line(stage1_raw_generations_path, stage1_raw_entry)
+                append_jsonl_line(stage1_output_path, clean)
+
+                counts = extract_boxed_counts(eval_text)
+                route_ok, route_bad = (counts if counts is not None else (ok1, n1 - ok1))
+                sel1 = _select_answer(gold=gold, majority=majority_answer_json, min_votes_to_accept=min_votes_to_accept)
+                next_stage = "stage2" if int(majority_answer_json.get("majority_count", 0)) < int(min_votes_to_accept) else "accepted"
+                append_jsonl_line(
+                    stage1_status_path,
+                    {
+                        "uuid": uuid,
+                        "stage": "stage1",
+                        "ok": int(route_ok),
+                        "bad": int(route_bad),
+                        "eval_ok": int(counts[0]) if counts is not None else None,
+                        "eval_bad": int(counts[1]) if counts is not None else None,
+                        "judge_ok": int(ok1),
+                        "judge_bad": int(n1 - ok1),
+                        "min_votes_to_accept": int(min_votes_to_accept),
+                        "vote_majority": majority_answer_json.get("majority"),
+                        "vote_majority_count": int(majority_answer_json.get("majority_count", 0)),
+                        **sel1,
+                        "next_stage": next_stage,
+                        "paths": {"infer": stage1_infer_path, "raw_generations": stage1_raw_generations_path, "output": stage1_output_path},
+                    },
+                )
+                stage1_done[uuid_key] = {"uuid": uuid, "ok": int(route_ok), "bad": int(route_bad), "next_stage": next_stage}
+
+                if next_stage == "stage2":
+                    stage2_inputs.append(
+                        {
+                            **{k: r.get(k) for k in CANONICAL_KEYS},
+                            "_stage1_ok": int(route_ok),
+                            "_stage1_bad": int(route_bad),
+                            "_difficulty": int(route_bad),
+                        }
+                    )
+                dt = time.monotonic() - t0
+                if prog is not None:
+                    prog.tick(dt)
+                if overall is not None:
+                    overall.tick(dt)
+
+            if stage2_inputs:
+                write_jsonl_atomic(stage2_input_path, stage2_inputs)
+            outs.append(stage1_status_path)
+            if prog is not None:
+                prog.finish()
 
     if overall is not None:
         overall.finish()
