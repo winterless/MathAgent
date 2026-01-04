@@ -6,6 +6,8 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+import concurrent.futures
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -344,6 +346,7 @@ class LLMClient:
         stats: Optional[Dict[str, int]] = None,
         finish_early: bool = True,
         think_tag: str = "",
+        max_workers: int = 1,
         debug_print_prompts: bool = False,
         debug_print_prompts_max_chars: int = 4000,
         debug_print_outputs: bool = False,
@@ -353,7 +356,7 @@ class LLMClient:
         """
         Generate n independent answers by calling chat_once n times.
         """
-        answers: List[str] = []
+        answers: List[str] = [""] * int(n)
 
         def _safe_print(*args: Any, **kwargs: Any) -> None:
             try:
@@ -361,6 +364,12 @@ class LLMClient:
             except BrokenPipeError:
                 # stdout closed (e.g. piping to `head`); avoid crashing the pipeline.
                 return
+
+        print_lock = threading.Lock()
+
+        def _safe_print_locked(*args: Any, **kwargs: Any) -> None:
+            with print_lock:
+                _safe_print(*args, **kwargs)
 
         mode = (prompt_mode or "problem").strip().lower()
         if mode in ("raw_prompt", "raw_prompt_eval"):
@@ -468,30 +477,63 @@ class LLMClient:
                 return s
             return s[:m] + "\n...<truncated>..."
 
-        for i in range(n):
+        # Streaming prints will interleave under parallel execution; force sequential in that case.
+        stream_this_global = bool(debug_stream_outputs and debug_print_outputs)
+        if stream_this_global:
+            max_workers = 1
+
+        workers = int(max_workers or 1)
+        if workers < 1:
+            workers = 1
+        workers = min(workers, int(n))
+
+        def _merge_stats(dst: Optional[Dict[str, int]], src: Optional[Dict[str, int]]) -> None:
+            if dst is None or not src:
+                return
+            for k, v in src.items():
+                try:
+                    dst[k] = int(dst.get(k, 0)) + int(v)
+                except Exception:
+                    # best-effort
+                    try:
+                        dst[k] = int(v)
+                    except Exception:
+                        continue
+
+        stats_lock = threading.Lock()
+
+        def _one(i: int) -> None:
+            # Stagger starts to preserve the intent of sleep_s as rate limiting, while still overlapping requests.
+            if sleep_s > 0:
+                time.sleep(max(0.0, float(sleep_s) * float(i)))
             user = base_user if mode in ("raw_prompt", "raw_prompt_eval") else f"{base_user}\n采样编号={i}"
+
+            local_stats: Optional[Dict[str, int]] = {} if stats is not None else None
+
             if debug_print_prompts:
                 header = (
                     f"\n========== [LLM_PROMPT] stage={stage_name} mode={mode} "
                     f"sample={i+1}/{n} model={self.config.model} base_url={self.config.base_url} "
                     f"temperature={temperature} max_tokens={max_tokens} timeout_s={self.config.timeout_s} ==========\n"
                 )
-                _safe_print(header, flush=True)
-                _safe_print("---- SYSTEM ----", flush=True)
-                _safe_print(_truncate(system), flush=True)
-                _safe_print("---- USER ----", flush=True)
-                _safe_print(_truncate(user), flush=True)
-                _safe_print("========== [LLM_PROMPT END] ==========\n", flush=True)
+                _safe_print_locked(header, flush=True)
+                _safe_print_locked("---- SYSTEM ----", flush=True)
+                _safe_print_locked(_truncate(system), flush=True)
+                _safe_print_locked("---- USER ----", flush=True)
+                _safe_print_locked(_truncate(user), flush=True)
+                _safe_print_locked("========== [LLM_PROMPT END] ==========\n", flush=True)
+
             try:
-                stream_this = bool(debug_stream_outputs and debug_print_outputs)
+                # Per-sample streaming is only safe in sequential mode.
+                stream_this = bool(stream_this_global)
                 if stream_this:
-                    _safe_print(
+                    _safe_print_locked(
                         f"========== [LLM_OUTPUT_STREAM] stage={stage_name} mode={mode} sample={i+1}/{n} ==========",
                         flush=True,
                     )
 
                     def _printer(piece: str) -> None:
-                        _safe_print(piece, end="", flush=True)
+                        _safe_print_locked(piece, end="", flush=True)
 
                 ans = self.chat_once(
                     stage_name=stage_name,
@@ -499,35 +541,49 @@ class LLMClient:
                     user=user,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    stats=stats,
+                    stats=local_stats,
                     stream=stream_this,
                     stream_printer=_printer if stream_this else None,
                 )
                 if stream_this:
-                    _safe_print("\n========== [LLM_OUTPUT_STREAM END] ==========\n", flush=True)
-                answers.append(ans)
+                    _safe_print_locked("\n========== [LLM_OUTPUT_STREAM END] ==========\n", flush=True)
+
+                answers[i] = ans
                 if debug_print_outputs and not stream_this:
-                    _safe_print(
+                    _safe_print_locked(
                         f"========== [LLM_OUTPUT] stage={stage_name} mode={mode} sample={i+1}/{n} ==========",
                         flush=True,
                     )
-                    _safe_print(_truncate_out(ans), flush=True)
-                    _safe_print("========== [LLM_OUTPUT END] ==========\n", flush=True)
+                    _safe_print_locked(_truncate_out(ans), flush=True)
+                    _safe_print_locked("========== [LLM_OUTPUT END] ==========\n", flush=True)
             except Exception as e:
-                if stats is not None:
-                    stats["errors"] = int(stats.get("errors", 0)) + 1
                 # Keep pipeline moving; caller can treat this as an incorrect attempt.
                 err_text = f"[LLM_ERROR stage={stage_name}]: {type(e).__name__}: {e}"
-                answers.append(err_text)
+                answers[i] = err_text
+                if local_stats is not None:
+                    local_stats["errors"] = int(local_stats.get("errors", 0)) + 1
                 if debug_print_outputs:
-                    _safe_print(
+                    _safe_print_locked(
                         f"========== [LLM_OUTPUT] stage={stage_name} mode={mode} sample={i+1}/{n} (ERROR) ==========",
                         flush=True,
                     )
-                    _safe_print(_truncate_out(err_text), flush=True)
-                    _safe_print("========== [LLM_OUTPUT END] ==========\n", flush=True)
-            if sleep_s > 0:
-                time.sleep(sleep_s)
+                    _safe_print_locked(_truncate_out(err_text), flush=True)
+                    _safe_print_locked("========== [LLM_OUTPUT END] ==========\n", flush=True)
+            finally:
+                if stats is not None and local_stats is not None:
+                    with stats_lock:
+                        _merge_stats(stats, local_stats)
+
+        if workers <= 1 or int(n) <= 1:
+            for i in range(int(n)):
+                _one(i)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = [ex.submit(_one, i) for i in range(int(n))]
+                for f in concurrent.futures.as_completed(futs):
+                    # propagate unexpected exceptions (should be rare; _one catches most)
+                    _ = f.result()
+
         return answers
 
 

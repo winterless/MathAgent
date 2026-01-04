@@ -244,6 +244,7 @@ class LLMRouter:
         stats: Optional[Dict[str, int]] = None,
         finish_early: Optional[bool] = None,
         think_tag: Optional[str] = None,
+        max_workers: Optional[int] = None,
         debug_print_prompts: Optional[bool] = None,
         debug_print_prompts_max_chars: Optional[int] = None,
         debug_print_outputs: Optional[bool] = None,
@@ -263,6 +264,7 @@ class LLMRouter:
             stats=stats,
             finish_early=self.option_bool("finish_early", True) if finish_early is None else bool(finish_early),
             think_tag=self.think_tag_for_stage(stage_name) if think_tag is None else str(think_tag),
+            max_workers=self.option_int("generate_n_max_workers", 8) if max_workers is None else int(max_workers),
             debug_print_prompts=self.option_bool("debug_print_prompts", False)
             if debug_print_prompts is None
             else bool(debug_print_prompts),
