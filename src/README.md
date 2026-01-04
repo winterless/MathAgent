@@ -54,24 +54,27 @@ PYTHONPATH=src python3 src/run_pipeline.py \
   --llm-config config/llm_models.json
 ```
 
+Note: `stage1_infer` expects **raw input JSONL**. If you pass an `--out` root directory as `--input`,
+it will only work when that directory already contains `*.stage0.jsonl` copies of the original inputs.
+
 Stage1 eval (consume `stage1_infer` and produce `stage1_output` + `status.stage1` + `stage2_input`):
 
 ```bash
 PYTHONPATH=src python3 src/run_pipeline.py \
   --mode stage1_eval \
-  --input datasets/out/demo_modular/stage1/example_input.stage1_infer.stage1.jsonl \
+  --input datasets/out/demo_modular \
   --out datasets/out/demo_modular \
   --llm-config config/llm_models.json
 ```
 
 ### Stage2: infer -> eval
 
-Stage2 infer (consume `stage1_output` and produce `stage2_infer`):
+Stage2 infer (prefer consuming `stage2_input` task list; fallback: derive it from `stage1_output` + `status.stage1`):
 
 ```bash
 PYTHONPATH=src python3 src/run_pipeline.py \
   --mode stage2_infer \
-  --input datasets/out/demo_modular/stage1/example_input.stage1_output.stage1.jsonl \
+  --input datasets/out/demo_modular \
   --out datasets/out/demo_modular \
   --llm-config config/llm_models.json
 ```
@@ -81,7 +84,7 @@ Stage2 eval (consume `stage2_infer` and produce `stage2_archive` + `status.stage
 ```bash
 PYTHONPATH=src python3 src/run_pipeline.py \
   --mode stage2_eval \
-  --input datasets/out/demo_modular/stage2/example_input.stage2_infer.stage2.jsonl \
+  --input datasets/out/demo_modular \
   --out datasets/out/demo_modular \
   --llm-config config/llm_models.json
 ```
@@ -93,7 +96,7 @@ Stage3 infer (consume `stage3_input` and produce `stage3_infer`):
 ```bash
 PYTHONPATH=src python3 src/run_pipeline.py \
   --mode stage3_infer \
-  --input datasets/out/demo_modular/stage3/example_input.stage3_input.stage3.jsonl \
+  --input datasets/out/demo_modular \
   --out datasets/out/demo_modular \
   --llm-config config/llm_models.json
 ```
@@ -103,7 +106,7 @@ Stage3 eval (consume `stage3_infer` and produce `stage3_archive` + `status.stage
 ```bash
 PYTHONPATH=src python3 src/run_pipeline.py \
   --mode stage3_eval \
-  --input datasets/out/demo_modular/stage3/example_input.stage3_infer.stage3.jsonl \
+  --input datasets/out/demo_modular \
   --out datasets/out/demo_modular \
   --llm-config config/llm_models.json
 ```

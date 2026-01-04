@@ -58,8 +58,35 @@ def _load_status_map(path: str) -> Dict[str, Dict[str, Any]]:
 
 
 def _iter_input_jsonl_paths(input_arg: str) -> List[str]:
-    """Return a sorted list of *.jsonl files if input_arg is a directory; otherwise [input_arg]."""
+    """
+    Return a sorted list of input JSONL files.
+
+    - If input_arg is a file: return [input_arg]
+    - If input_arg is a directory:
+      - If it looks like an output root (contains stage subdirs) and has *.stage0.jsonl, use those.
+      - Otherwise, use top-level *.jsonl files (non-recursive, historical behavior).
+    """
     if os.path.isdir(input_arg):
+        # If the user points --input at an out root (e.g. datasets/out/demo_modular),
+        # prefer the original copied inputs (<prefix>.stage0.jsonl) to avoid accidentally
+        # treating artifacts as raw inputs.
+        has_stage_subdir = any(os.path.isdir(os.path.join(input_arg, d)) for d in ("stage1", "stage2", "stage3"))
+        stage0s: List[str] = []
+        try:
+            for name in os.listdir(input_arg):
+                p = os.path.join(input_arg, name)
+                if os.path.isfile(p) and name.lower().endswith(".stage0.jsonl"):
+                    stage0s.append(p)
+        except FileNotFoundError:
+            stage0s = []
+        if stage0s:
+            stage0s.sort()
+            return stage0s
+        if has_stage_subdir:
+            raise ValueError(
+                f"--input points to an output root without any '*.stage0.jsonl' inputs: {input_arg}. "
+                f"For stage1_infer please pass a raw input JSONL (file/dir) or an out root that contains stage0 copies."
+            )
         files: List[str] = []
         for name in os.listdir(input_arg):
             p = os.path.join(input_arg, name)
@@ -93,12 +120,18 @@ MODES = [
 
 
 def _iter_artifacts(input_arg: str, *, suffix: str) -> List[str]:
-    """Return artifact file paths ending with suffix (input_arg may be file or directory)."""
+    """
+    Return artifact file paths ending with suffix (input_arg may be file or directory).
+
+    Supports passing an out root directory (e.g. datasets/out/demo_modular); in that case we
+    search recursively under the directory for matching artifacts.
+    """
     if os.path.isdir(input_arg):
         outs: List[str] = []
-        for name in os.listdir(input_arg):
-            if name.endswith(suffix) and name.lower().endswith(".jsonl"):
-                outs.append(os.path.join(input_arg, name))
+        for root, _dirs, files in os.walk(input_arg):
+            for name in files:
+                if name.lower().endswith(".jsonl") and name.endswith(suffix):
+                    outs.append(os.path.join(root, name))
         outs.sort()
         return outs
     return [input_arg]
@@ -541,7 +574,8 @@ def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
 def mode_stage2_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_to_accept: int, sleep_s: float) -> List[str]:
     """
     Route-A mode: stage2_infer
-    Input: stage1_output.stage1.jsonl (file) or a directory containing *stage1_output.stage1.jsonl files.
+    Input: stage2_input.stage2.jsonl (file) or a directory/out-root containing *stage2_input.stage2.jsonl files.
+           (backward-compatible fallback: stage1_output.stage1.jsonl)
     Output: stage2/<prefix>.stage2_infer.stage2.jsonl (one per input artifact)
             stage2/<prefix>.stage2_input.stage2.jsonl (the derived next-step inputs)
     """
@@ -549,79 +583,98 @@ def mode_stage2_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
     stage2_dir = dirs["stage2"]
 
     outs: List[str] = []
-    for stage1_output_path in _iter_artifacts(input_arg, suffix="stage1_output.stage1.jsonl"):
-        prefix = _infer_prefix_from_artifact(stage1_output_path, suffix="stage1_output.stage1.jsonl")
+    # Prefer task-list input (stage2_input). If the user passes an out-root dir, this aligns with stage3_infer.
+    artifact_paths: List[str] = []
+    if os.path.isdir(input_arg):
+        artifact_paths = _iter_artifacts(input_arg, suffix="stage2_input.stage2.jsonl")
+        if not artifact_paths:
+            artifact_paths = _iter_artifacts(input_arg, suffix="stage1_output.stage1.jsonl")
+    else:
+        artifact_paths = [input_arg]
+
+    for in_path in artifact_paths:
+        base = os.path.basename(in_path)
+        is_stage2_input = base.endswith("stage2_input.stage2.jsonl")
+        is_stage1_output = base.endswith("stage1_output.stage1.jsonl")
+
+        if is_stage2_input:
+            prefix = _infer_prefix_from_artifact(in_path, suffix="stage2_input.stage2.jsonl")
+        elif is_stage1_output:
+            prefix = _infer_prefix_from_artifact(in_path, suffix="stage1_output.stage1.jsonl")
+        else:
+            raise ValueError(
+                f"stage2_infer expects stage2_input.stage2.jsonl (preferred) or stage1_output.stage1.jsonl, got: {in_path}"
+            )
+
         pfx = f"{prefix}." if prefix else ""
         stage2_infer_path = os.path.join(stage2_dir, f"{pfx}stage2_infer.stage2.jsonl")
         stage2_input_path = os.path.join(stage2_dir, f"{pfx}stage2_input.stage2.jsonl")
 
-        # Prefer status-driven routing.
-        # If status is available, use:
-        #   next_stage = stage2  <=>  final_vote_count < min_votes_to_accept
-        # Otherwise, fall back to stage1_output's eval boxed counts (best-effort).
-        stage1_status_path = os.path.join(os.path.dirname(stage1_output_path), f"{pfx}status.stage1.jsonl")
-        stage1_status = _load_status_map(stage1_status_path)
-
         candidates: List[Dict[str, Any]] = []
-        for row in iter_jsonl(stage1_output_path, tolerate_errors=True):
-            u = row.get("uuid")
-            if u is None:
-                continue
-            u_key = str(u)
+        if is_stage2_input:
+            # stage2_input already represents the routed task list.
+            for row in iter_jsonl(in_path, tolerate_errors=True):
+                u = row.get("uuid")
+                if u is None:
+                    continue
+                candidates.append(row)
+            # Ensure a local copy exists (idempotent).
+            if candidates and (not os.path.exists(stage2_input_path) or os.path.getsize(stage2_input_path) == 0):
+                write_jsonl_atomic(stage2_input_path, candidates)
+        else:
+            # Backward-compatible: derive stage2_input from stage1_output + status.stage1.
+            stage1_output_path = in_path
+            stage1_status_path = os.path.join(os.path.dirname(stage1_output_path), f"{pfx}status.stage1.jsonl")
+            stage1_status = _load_status_map(stage1_status_path)
+            for row in iter_jsonl(stage1_output_path, tolerate_errors=True):
+                u = row.get("uuid")
+                if u is None:
+                    continue
+                u_key = str(u)
+                st = stage1_status.get(u_key, {})
+                fv = st.get("final_vote_count")
+                mv = st.get("min_votes_to_accept")
+                try:
+                    fv_i = int(fv) if fv is not None else None
+                except Exception:
+                    fv_i = None
+                try:
+                    mv_i = int(mv) if mv is not None else int(min_votes_to_accept)
+                except Exception:
+                    mv_i = int(min_votes_to_accept)
 
-            st = stage1_status.get(u_key, {})
-            fv = st.get("final_vote_count")
-            mv = st.get("min_votes_to_accept")
-            try:
-                fv_i = int(fv) if fv is not None else None
-            except Exception:
-                fv_i = None
-            try:
-                mv_i = int(mv) if mv is not None else int(min_votes_to_accept)
-            except Exception:
-                mv_i = int(min_votes_to_accept)
+                if fv_i is not None:
+                    need_stage2 = fv_i < mv_i
+                else:
+                    need_stage2 = str(st.get("next_stage") or "") == "stage2"
+                if not need_stage2:
+                    continue
 
-            # Determine whether this uuid should enter stage2
-            if fv_i is not None:
-                need_stage2 = fv_i < mv_i
-            else:
-                # fallback: use saved next_stage if present
-                need_stage2 = str(st.get("next_stage") or "") == "stage2"
-
-            if not need_stage2:
-                # Accepted at stage1 (or no routing info says stage2)
-                continue
-
-            # Difficulty/ok/bad: prefer status if present.
-            okc = st.get("ok")
-            badc = st.get("bad")
-            try:
-                okc_i = int(okc) if okc is not None else 0
-            except Exception:
-                okc_i = 0
-            try:
-                badc_i = int(badc) if badc is not None else 0
-            except Exception:
-                badc_i = 0
-
-            # If no status exists, best-effort parse eval boxed counts from stage1_output content.
-            if not stage1_status:
-                counts = extract_boxed_counts_from_output(row.get("output"))
-                if counts is not None:
-                    okc_i, badc_i = int(counts[0]), int(counts[1])
-
-            diff = badc_i
-            candidates.append(
-                {
-                    **{k: row.get(k) for k in CANONICAL_KEYS},
-                    "_stage1_ok": int(okc),
-                    "_stage1_bad": int(badc),
-                    "_difficulty": int(diff),
-                }
-            )
-
-        if candidates:
-            write_jsonl_atomic(stage2_input_path, candidates)
+                okc = st.get("ok")
+                badc = st.get("bad")
+                try:
+                    okc_i = int(okc) if okc is not None else 0
+                except Exception:
+                    okc_i = 0
+                try:
+                    badc_i = int(badc) if badc is not None else 0
+                except Exception:
+                    badc_i = 0
+                if not stage1_status:
+                    counts = extract_boxed_counts_from_output(row.get("output"))
+                    if counts is not None:
+                        okc_i, badc_i = int(counts[0]), int(counts[1])
+                diff = badc_i
+                candidates.append(
+                    {
+                        **{k: row.get(k) for k in CANONICAL_KEYS},
+                        "_stage1_ok": int(okc_i),
+                        "_stage1_bad": int(badc_i),
+                        "_difficulty": int(diff),
+                    }
+                )
+            if candidates:
+                write_jsonl_atomic(stage2_input_path, candidates)
 
         infer_done: set[str] = set()
         if os.path.exists(stage2_infer_path):
@@ -658,15 +711,15 @@ def mode_stage2_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
                     "uuid": uuid,
                     "line_number": r.get("line_number"),
                     "stage": "stage2_infer",
-                    "difficulty": r.get("_difficulty"),
+                    "difficulty": r.get("_difficulty") if "_difficulty" in r else r.get("difficulty"),
                     "question": q_raw,
                     "answer": gold,
                     "gold": gold,
                     "model_input": model_q,
                     "raw_model_outputs": [str(x) for x in raw_solutions][:n2],
                     "extracted_answers": [str(x) for x in standardized][:n2],
-                    "stage1_ok": r.get("_stage1_ok"),
-                    "stage1_bad": r.get("_stage1_bad"),
+                    "stage1_ok": r.get("_stage1_ok") if "_stage1_ok" in r else r.get("stage1_ok"),
+                    "stage1_bad": r.get("_stage1_bad") if "_stage1_bad" in r else r.get("stage1_bad"),
                     "min_votes_to_accept": int(min_votes_to_accept),
                     "llm_call_counts": {
                         "stage2_solve": llm.stage_params("stage2_solve").n,
