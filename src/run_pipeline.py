@@ -133,6 +133,14 @@ class _UUIDProgress:
         self.processed = 0
         self.sum_uuid_s = 0.0
         self._last_print = 0.0
+        # NOTE:
+        # - In a real TTY we can use '\r' to repaint a single line.
+        # - In many log collectors, '\r' without '\n' is not visible, so we fall back
+        #   to newline-based progress output when stderr is not a TTY.
+        try:
+            self._isatty = bool(sys.stderr.isatty())
+        except Exception:
+            self._isatty = False
 
     def start(self) -> None:
         self._print(force=True)
@@ -150,7 +158,8 @@ class _UUIDProgress:
 
     def _print(self, *, force: bool, final: bool = False) -> None:
         now = time.monotonic()
-        if not force and (now - self._last_print) < 0.25:
+        min_interval_s = 0.25 if self._isatty else 5.0
+        if not force and (now - self._last_print) < float(min_interval_s):
             return
         self._last_print = now
         done_total = self.already_done + self.processed
@@ -164,10 +173,15 @@ class _UUIDProgress:
         tag = f"{self.label}" + (f"/{self.prefix}" if self.prefix else "")
         msg = f"[{tag}] {pct:6.2f}% ({done_total}/{self.total}) avg {avg:.2f}s/uuid"
         try:
-            sys.stderr.write("\r" + msg + "\033[K")
-            if final:
-                sys.stderr.write("\n")
-            sys.stderr.flush()
+            if self._isatty:
+                sys.stderr.write("\r" + msg + "\033[K")
+                if final:
+                    sys.stderr.write("\n")
+                sys.stderr.flush()
+            else:
+                # Log-friendly: always newline-terminated, so collectors show it.
+                sys.stderr.write(msg + "\n")
+                sys.stderr.flush()
         except Exception:
             # Best-effort progress output; never fail pipeline.
             if final:
