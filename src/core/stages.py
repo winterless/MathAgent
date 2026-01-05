@@ -7,8 +7,9 @@ JsonDict = Dict[str, Any]
 
 _ABCD_RE = re.compile(r"(?<![A-Za-z0-9])[ABCD](?![A-Za-z0-9])")
 _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
-_BOXED_ANS_RE = re.compile(r"\\boxed\s*\{\s*(?P<ans>[ABCD])\s*\}", re.IGNORECASE)
-_BOXED_ANY_RE = re.compile(r"\\boxed\s*\{\s*(?P<ans>[^}]+?)\s*\}", re.IGNORECASE)
+# Accept both '\boxed{...}' and '\\boxed{...}' (models / JSON escaping can introduce extra backslashes).
+_BOXED_ANS_RE = re.compile(r"\\+boxed\s*\{\s*(?P<ans>[ABCD])\s*\}", re.IGNORECASE)
+_BOXED_ANY_RE = re.compile(r"\\+boxed\s*\{\s*(?P<ans>[^}]+?)\s*\}", re.IGNORECASE)
 _ANSWER_LINE_RE = re.compile(r"(?:最终答案|答案)\s*[:：]?\s*(?P<ans>[ABCD])", re.IGNORECASE)
 _FINAL_LINE_RE = re.compile(r"(?mi)^\s*FINAL\s*[:：]\s*(?P<ans>.+?)\s*$")
 _ANSWER_ANY_LINE_RE = re.compile(r"(?mi)^\s*(?:最终答案|答案)\s*[:：]?\s*(?P<ans>.+?)\s*$")
