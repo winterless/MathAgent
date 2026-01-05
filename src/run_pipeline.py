@@ -135,12 +135,39 @@ class _UUIDProgress:
         self._last_print = 0.0
         # NOTE:
         # - In a real TTY we can use '\r' to repaint a single line.
-        # - In many log collectors, '\r' without '\n' is not visible, so we fall back
-        #   to newline-based progress output when stderr is not a TTY.
+        # - In many log collectors, '\r' without '\n' is not visible.
+        # - Also, in orchestration (python parent process + subprocess), stderr may not be captured/displayed.
+        #   So in non-TTY contexts we default to stdout for progress lines.
+        #
+        # Override via env:
+        #   - MATHAGENT_PROGRESS_STREAM=stdout|stderr|auto
+        #   - MATHAGENT_PROGRESS_INTERVAL_S=<float>
         try:
-            self._isatty = bool(sys.stderr.isatty())
+            stream_opt = str(os.environ.get("MATHAGENT_PROGRESS_STREAM", "auto") or "auto").strip().lower()
+        except Exception:
+            stream_opt = "auto"
+        if stream_opt in ("stdout", "out", "1"):
+            self._stream = sys.stdout
+        elif stream_opt in ("stderr", "err", "2"):
+            self._stream = sys.stderr
+        else:
+            # auto: tty -> stderr (keeps progress separate from normal output); non-tty -> stdout (more visible in logs)
+            self._stream = sys.stderr
+            try:
+                if not bool(sys.stderr.isatty()):
+                    self._stream = sys.stdout
+            except Exception:
+                self._stream = sys.stdout
+
+        try:
+            self._isatty = bool(getattr(self._stream, "isatty", lambda: False)())
         except Exception:
             self._isatty = False
+
+        try:
+            self._interval_s = float(os.environ.get("MATHAGENT_PROGRESS_INTERVAL_S", "") or 0.0)
+        except Exception:
+            self._interval_s = 0.0
 
     def start(self) -> None:
         self._print(force=True)
@@ -158,7 +185,7 @@ class _UUIDProgress:
 
     def _print(self, *, force: bool, final: bool = False) -> None:
         now = time.monotonic()
-        min_interval_s = 0.25 if self._isatty else 5.0
+        min_interval_s = float(self._interval_s) if float(self._interval_s) > 0 else (0.25 if self._isatty else 5.0)
         if not force and (now - self._last_print) < float(min_interval_s):
             return
         self._last_print = now
@@ -174,19 +201,19 @@ class _UUIDProgress:
         msg = f"[{tag}] {pct:6.2f}% ({done_total}/{self.total}) avg {avg:.2f}s/uuid"
         try:
             if self._isatty:
-                sys.stderr.write("\r" + msg + "\033[K")
+                self._stream.write("\r" + msg + "\033[K")
                 if final:
-                    sys.stderr.write("\n")
-                sys.stderr.flush()
+                    self._stream.write("\n")
+                self._stream.flush()
             else:
                 # Log-friendly: always newline-terminated, so collectors show it.
-                sys.stderr.write(msg + "\n")
-                sys.stderr.flush()
+                self._stream.write(msg + "\n")
+                self._stream.flush()
         except Exception:
             # Best-effort progress output; never fail pipeline.
             if final:
                 try:
-                    print(msg, file=sys.stderr, flush=True)
+                    print(msg, file=self._stream, flush=True)
                 except Exception:
                     pass
 
