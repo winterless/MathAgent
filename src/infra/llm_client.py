@@ -417,25 +417,9 @@ class LLMClient:
                     "最后一行必须且只能是：\\boxed{解答正确：x，解答错误：y}\n"
                 )
             base_user = question.strip()
-        elif mode == "boxed_solve":
-            # Stage2/Stage3 solving: enforce \boxed{...} for reliable extraction.
-            system = (
-                f"你是一个数学解题助手。Stage={stage_name}。\n"
-                "你可以输出推理过程（尽量简短，避免复述题目）。\n"
-                "为防止长输出被截断：第一行必须先输出最终答案，格式为 \\boxed{...}（必须出现且只需出现一次）。\n"
-                "如果题目是选择题：\\boxed{<答案>} 中 <答案> 只能是单个大写字母 A/B/C/D。\n"
-                "如果题目不是选择题：\\boxed{<答案>} 中 <答案> 为最终数值/表达式。\n"
-                "不要输出 FINAL: 格式。"
-            )
-            if finish_early:
-                system += (
-                    "\n\n"
-                    "如果你感觉推理会很长、或可能来不及写完，请立刻停止推理，直接给出你认为最可能的最终答案。\n"
-                    "选择题必须在 A/B/C/D 中猜测一个字母；不要输出多余内容。"
-                )
-            # User side only asks the question (per Architecture.md).
-            base_user = question.strip()
         else:
+            if mode == "boxed_solve":
+                raise ValueError("prompt_mode='boxed_solve' has been removed; use prompt_mode='problem' (final answer as the last line: 'FINAL: <答案>').")
             system = (
                 f"你是一个数学解题助手。Stage={stage_name}。\n"
                 "最后一行必须输出最终答案，且格式必须严格为：FINAL: <答案>\n"

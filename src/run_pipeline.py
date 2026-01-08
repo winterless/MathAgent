@@ -1165,7 +1165,7 @@ def mode_stage2_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
             raw_solutions = llm.generate_n(
                 stage_name="stage2_solve",
                 question=model_q,
-                prompt_mode="boxed_solve",
+                prompt_mode="problem",
                 sleep_s=sleep_s,
                 stats=s2_solve_stats,
             )
@@ -1495,7 +1495,7 @@ def mode_stage3_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
             raw_solutions = llm.generate_n(
                 stage_name="stage3_solve",
                 question=model_q,
-                prompt_mode="boxed_solve",
+                prompt_mode="problem",
                 sleep_s=sleep_s,
                 stats=s3_solve_stats,
             )
@@ -2320,7 +2320,7 @@ def _run_one_input(
         raw_solutions = llm.generate_n(
             stage_name="stage2_solve",
             question=model_q,
-            prompt_mode="boxed_solve",
+            prompt_mode="problem",
             sleep_s=sleep_s,
             stats=s2_solve_stats,
         )
@@ -2477,7 +2477,7 @@ def _run_one_input(
         raw_solutions = llm.generate_n(
             stage_name="stage3_solve",
             question=model_q,
-            prompt_mode="boxed_solve",
+            prompt_mode="problem",
             sleep_s=sleep_s,
             stats=s3_solve_stats,
         )

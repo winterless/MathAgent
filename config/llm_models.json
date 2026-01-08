@@ -62,7 +62,7 @@
     "min_votes_to_accept": 5
   },
   "options": {
-    "finish_early": true,
+    "finish_early": false,
     "debug_print_prompts": false,
     "debug_print_prompts_max_chars": 4000,
     "debug_print_outputs": true,
