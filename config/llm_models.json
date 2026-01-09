@@ -68,6 +68,7 @@
     "debug_print_outputs": true,
     "debug_print_outputs_max_chars": 2000,
     "debug_stream_outputs": false,
+    "generate_n_max_workers": 2,
     "think_tag_default": "",
     "think_tag_by_profile": {
       "base": "",

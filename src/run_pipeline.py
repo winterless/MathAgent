@@ -59,6 +59,56 @@ def _load_status_map(path: str) -> Dict[str, Dict[str, Any]]:
     return m
 
 
+def _load_done_uuid_set(path: str) -> set[str]:
+    """
+    Load a status/result jsonl file into a set of processed UUID strings.
+    This is much lighter than _load_status_map() for very large runs.
+    """
+    if not path or not os.path.exists(path):
+        return set()
+    s: set[str] = set()
+    for row in iter_jsonl(path, tolerate_errors=True):
+        u = row.get("uuid")
+        if u is None:
+            continue
+        s.add(str(u))
+    return s
+
+
+def _count_total_and_done_uuids(*, input_path: str, done_uuids: set[str] | None = None) -> tuple[int, int]:
+    """
+    Count how many rows in input_path have a UUID, and how many are in done_uuids.
+    Uses streaming scan; does not materialize the file in memory.
+    """
+    total = 0
+    done = 0
+    dset = done_uuids or set()
+    for row in iter_jsonl(input_path, tolerate_errors=True):
+        u = row.get("uuid")
+        if u is None:
+            continue
+        total += 1
+        if dset and str(u) in dset:
+            done += 1
+    return total, done
+
+
+def _write_jsonl_stream_atomic(path: str, rows: Any) -> None:
+    """
+    Write an iterator of dict rows to jsonl atomically (streaming, low memory).
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in rows:
+            try:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            except Exception:
+                # Best-effort: skip bad rows; never crash long runs.
+                continue
+    os.replace(tmp, path)
+
+
 def _iter_input_jsonl_paths(input_arg: str) -> List[str]:
     """
     Return a sorted list of input JSONL files.
@@ -1039,19 +1089,10 @@ def mode_stage2_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
             prefix = _infer_prefix_from_artifact(in_path, suffix="stage2_input.stage2.jsonl")
             pfx = f"{prefix}." if prefix else ""
             stage2_infer_path = os.path.join(stage2_dir, f"{pfx}stage2_infer.stage2.jsonl")
-            uuids: List[str] = []
-            for row in iter_jsonl(in_path, tolerate_errors=True):
-                u = row.get("uuid")
-                if u is not None:
-                    uuids.append(str(u))
-            total_all += len(uuids)
-            if os.path.exists(stage2_infer_path):
-                infer_done: set[str] = set()
-                for rr in iter_jsonl(stage2_infer_path, tolerate_errors=True):
-                    u2 = rr.get("uuid")
-                    if u2 is not None:
-                        infer_done.add(str(u2))
-                done_all += sum(1 for u in uuids if u in infer_done)
+            infer_done = _load_done_uuid_set(stage2_infer_path)
+            t_i, d_i = _count_total_and_done_uuids(input_path=in_path, done_uuids=infer_done)
+            total_all += int(t_i)
+            done_all += int(d_i)
         overall = _UUIDProgress(label="stage2_infer", total=total_all, already_done=done_all, prefix="ALL")
         overall.start()
 
@@ -1073,90 +1114,102 @@ def mode_stage2_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
         stage2_infer_path = os.path.join(stage2_dir, f"{pfx}stage2_infer.stage2.jsonl")
         stage2_input_path = os.path.join(stage2_dir, f"{pfx}stage2_input.stage2.jsonl")
 
-        candidates: List[Dict[str, Any]] = []
+        # Ensure we have a stage2_input task list to consume, without materializing the whole file.
+        effective_stage2_input = in_path
         if is_stage2_input:
-            # stage2_input already represents the routed task list.
-            for row in iter_jsonl(in_path, tolerate_errors=True):
-                u = row.get("uuid")
-                if u is None:
-                    continue
-                candidates.append(row)
-            # Ensure a local copy exists (idempotent).
-            if candidates and (not os.path.exists(stage2_input_path) or os.path.getsize(stage2_input_path) == 0):
-                write_jsonl_atomic(stage2_input_path, candidates)
+            # Ensure a local copy exists (idempotent) without loading all rows into memory.
+            try:
+                need_copy = (not os.path.exists(stage2_input_path)) or (os.path.getsize(stage2_input_path) == 0)
+            except Exception:
+                need_copy = True
+            if need_copy:
+                try:
+                    tmp = f"{stage2_input_path}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
+                    shutil.copyfile(in_path, tmp)
+                    os.replace(tmp, stage2_input_path)
+                except Exception:
+                    # Best-effort; the pipeline can still read from in_path directly.
+                    pass
+            effective_stage2_input = in_path
         else:
             # Backward-compatible: derive stage2_input from stage1_output + status.stage1.
-            stage1_output_path = in_path
-            stage1_status_path = os.path.join(os.path.dirname(stage1_output_path), f"{pfx}status.stage1.jsonl")
-            stage1_status = _load_status_map(stage1_status_path)
-            for row in iter_jsonl(stage1_output_path, tolerate_errors=True):
-                u = row.get("uuid")
-                if u is None:
-                    continue
-                u_key = str(u)
-                st = stage1_status.get(u_key, {})
-                fv = st.get("final_vote_count")
-                mv = st.get("min_votes_to_accept")
-                try:
-                    fv_i = int(fv) if fv is not None else None
-                except Exception:
-                    fv_i = None
-                try:
-                    mv_i = int(mv) if mv is not None else int(min_votes_to_accept)
-                except Exception:
-                    mv_i = int(min_votes_to_accept)
+            effective_stage2_input = stage2_input_path
+            try:
+                need_build = (not os.path.exists(stage2_input_path)) or (os.path.getsize(stage2_input_path) == 0)
+            except Exception:
+                need_build = True
+            if need_build:
+                stage1_output_path = in_path
+                stage1_status_path = os.path.join(os.path.dirname(stage1_output_path), f"{pfx}status.stage1.jsonl")
+                stage1_status = _load_status_map(stage1_status_path)
 
-                if fv_i is not None:
-                    need_stage2 = fv_i < mv_i
-                else:
-                    need_stage2 = str(st.get("next_stage") or "") == "stage2"
-                if not need_stage2:
-                    continue
+                def _rows() -> Any:
+                    for row in iter_jsonl(stage1_output_path, tolerate_errors=True):
+                        u = row.get("uuid")
+                        if u is None:
+                            continue
+                        u_key = str(u)
+                        st = stage1_status.get(u_key, {})
+                        fv = st.get("final_vote_count")
+                        mv = st.get("min_votes_to_accept")
+                        try:
+                            fv_i = int(fv) if fv is not None else None
+                        except Exception:
+                            fv_i = None
+                        try:
+                            mv_i = int(mv) if mv is not None else int(min_votes_to_accept)
+                        except Exception:
+                            mv_i = int(min_votes_to_accept)
 
-                okc = st.get("ok")
-                badc = st.get("bad")
-                try:
-                    okc_i = int(okc) if okc is not None else 0
-                except Exception:
-                    okc_i = 0
-                try:
-                    badc_i = int(badc) if badc is not None else 0
-                except Exception:
-                    badc_i = 0
-                if not stage1_status:
-                    counts = extract_boxed_counts_from_output(row.get("output"))
-                    if counts is not None:
-                        okc_i, badc_i = int(counts[0]), int(counts[1])
-                diff = badc_i
-                candidates.append(
-                    {
-                        **{k: row.get(k) for k in CANONICAL_KEYS},
-                        "_stage1_ok": int(okc_i),
-                        "_stage1_bad": int(badc_i),
-                        "_difficulty": int(diff),
-                    }
-                )
-            if candidates:
-                write_jsonl_atomic(stage2_input_path, candidates)
+                        if fv_i is not None:
+                            need_stage2 = fv_i < mv_i
+                        else:
+                            need_stage2 = str(st.get("next_stage") or "") == "stage2"
+                        if not need_stage2:
+                            continue
 
-        infer_done: set[str] = set()
-        if os.path.exists(stage2_infer_path):
-            for r in iter_jsonl(stage2_infer_path, tolerate_errors=True):
-                uu = r.get("uuid")
-                if uu is not None:
-                    infer_done.add(str(uu))
+                        okc = st.get("ok")
+                        badc = st.get("bad")
+                        try:
+                            okc_i = int(okc) if okc is not None else 0
+                        except Exception:
+                            okc_i = 0
+                        try:
+                            badc_i = int(badc) if badc is not None else 0
+                        except Exception:
+                            badc_i = 0
+                        if not stage1_status:
+                            counts = extract_boxed_counts_from_output(row.get("output"))
+                            if counts is not None:
+                                okc_i, badc_i = int(counts[0]), int(counts[1])
+                        diff = badc_i
+                        yield {
+                            **{k: row.get(k) for k in CANONICAL_KEYS},
+                            "_stage1_ok": int(okc_i),
+                            "_stage1_bad": int(badc_i),
+                            "_difficulty": int(diff),
+                        }
 
-        all_uuid_rows = [r for r in candidates if r.get("uuid") is not None]
-        to_process = [r for r in all_uuid_rows if str(r.get("uuid")) not in infer_done]
+                _write_jsonl_stream_atomic(stage2_input_path, _rows())
+
+        infer_done = _load_done_uuid_set(stage2_infer_path)
+        total_rows, done_rows = _count_total_and_done_uuids(input_path=effective_stage2_input, done_uuids=infer_done)
+        total_rows = int(total_rows)
+        done_rows = int(done_rows)
+
         prog: _UUIDProgress | None = None
         if not multi:
-            prog = _UUIDProgress(label="stage2_infer", prefix=prefix, total=len(all_uuid_rows), already_done=len(all_uuid_rows) - len(to_process))
+            prog = _UUIDProgress(label="stage2_infer", prefix=prefix, total=total_rows, already_done=done_rows)
             prog.start()
 
-        for r in to_process:
-            t0 = time.monotonic()
+        for r in iter_jsonl(effective_stage2_input, tolerate_errors=True):
             uuid = r.get("uuid")
+            if uuid is None:
+                continue
             uuid_key = str(uuid)
+            if uuid_key in infer_done:
+                continue
+            t0 = time.monotonic()
             q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
             gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
             model_q = append_choice_map_if_any(normalize_for_model(q_raw))
@@ -1246,14 +1299,10 @@ def mode_stage2_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
             prefix = _infer_prefix_from_artifact(p, suffix="stage2_infer.stage2.jsonl")
             pfx = f"{prefix}." if prefix else ""
             stage2_status_path = os.path.join(stage2_dir, f"{pfx}status.stage2.jsonl")
-            done_map = _load_status_map(stage2_status_path)
-            uuids: List[str] = []
-            for r in iter_jsonl(p, tolerate_errors=True):
-                u = r.get("uuid")
-                if u is not None:
-                    uuids.append(str(u))
-            total_all += len(uuids)
-            done_all += sum(1 for u in uuids if u in done_map)
+            done_set = _load_done_uuid_set(stage2_status_path)
+            t_i, d_i = _count_total_and_done_uuids(input_path=p, done_uuids=done_set)
+            total_all += int(t_i)
+            done_all += int(d_i)
         overall = _UUIDProgress(label="stage2_eval", total=total_all, already_done=done_all, prefix="ALL")
         overall.start()
 
@@ -1265,26 +1314,21 @@ def mode_stage2_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
         stage2_status_path = os.path.join(stage2_dir, f"{pfx}status.stage2.jsonl")
         stage3_input_path = os.path.join(stage3_dir, f"{pfx}stage3_input.stage3.jsonl")
 
-        done = _load_status_map(stage2_status_path)
-        stage3_inputs: List[Dict[str, Any]] = []
+        done_set = _load_done_uuid_set(stage2_status_path)
+        total_rows, done_rows = _count_total_and_done_uuids(input_path=stage2_infer_path, done_uuids=done_set)
+        prog: _UUIDProgress | None = None
+        if not multi:
+            prog = _UUIDProgress(label="stage2_eval", prefix=prefix, total=int(total_rows), already_done=int(done_rows))
+            prog.start()
 
-        all_rows: List[Dict[str, Any]] = []
         for r in iter_jsonl(stage2_infer_path, tolerate_errors=True):
             uuid = r.get("uuid")
             if uuid is None:
                 continue
-            all_rows.append(r)
-
-        to_process = [r for r in all_rows if str(r.get("uuid")) not in done]
-        prog: _UUIDProgress | None = None
-        if not multi:
-            prog = _UUIDProgress(label="stage2_eval", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
-            prog.start()
-
-        for r in to_process:
-            t0 = time.monotonic()
-            uuid = r.get("uuid")
             uuid_key = str(uuid)
+            if uuid_key in done_set:
+                continue
+            t0 = time.monotonic()
             q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
             gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
             model_q = r.get("model_input") if isinstance(r.get("model_input"), str) else append_choice_map_if_any(normalize_for_model(q_raw))
@@ -1397,13 +1441,14 @@ def mode_stage2_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
             )
 
             if next_stage == "stage3":
-                stage3_inputs.append(
+                append_jsonl_line(
+                    stage3_input_path,
                     {
                         **{k: r.get(k) for k in CANONICAL_KEYS},
                         "_difficulty": r.get("difficulty"),
                         "_stage1_ok": r.get("stage1_ok"),
                         "_stage1_bad": r.get("stage1_bad"),
-                    }
+                    },
                 )
             dt = time.monotonic() - t0
             if prog is not None:
@@ -1411,8 +1456,6 @@ def mode_stage2_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
             if overall is not None:
                 overall.tick(dt)
 
-        if stage3_inputs:
-            write_jsonl_atomic(stage3_input_path, stage3_inputs)
         outs.append(stage2_status_path)
         if prog is not None:
             prog.finish()
@@ -1442,19 +1485,10 @@ def mode_stage3_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
             prefix = _infer_prefix_from_artifact(p, suffix="stage3_input.stage3.jsonl")
             pfx = f"{prefix}." if prefix else ""
             stage3_infer_path = os.path.join(stage3_dir, f"{pfx}stage3_infer.stage3.jsonl")
-            uuids: List[str] = []
-            for r in iter_jsonl(p, tolerate_errors=True):
-                u = r.get("uuid")
-                if u is not None:
-                    uuids.append(str(u))
-            total_all += len(uuids)
-            if os.path.exists(stage3_infer_path):
-                infer_done: set[str] = set()
-                for rr in iter_jsonl(stage3_infer_path, tolerate_errors=True):
-                    u2 = rr.get("uuid")
-                    if u2 is not None:
-                        infer_done.add(str(u2))
-                done_all += sum(1 for u in uuids if u in infer_done)
+            infer_done = _load_done_uuid_set(stage3_infer_path)
+            t_i, d_i = _count_total_and_done_uuids(input_path=p, done_uuids=infer_done)
+            total_all += int(t_i)
+            done_all += int(d_i)
         overall = _UUIDProgress(label="stage3_infer", total=total_all, already_done=done_all, prefix="ALL")
         overall.start()
 
@@ -1463,30 +1497,21 @@ def mode_stage3_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
         pfx = f"{prefix}." if prefix else ""
         stage3_infer_path = os.path.join(stage3_dir, f"{pfx}stage3_infer.stage3.jsonl")
 
-        infer_done: set[str] = set()
-        if os.path.exists(stage3_infer_path):
-            for rr in iter_jsonl(stage3_infer_path, tolerate_errors=True):
-                uu = rr.get("uuid")
-                if uu is not None:
-                    infer_done.add(str(uu))
+        infer_done = _load_done_uuid_set(stage3_infer_path)
+        total_rows, done_rows = _count_total_and_done_uuids(input_path=stage3_input_path, done_uuids=infer_done)
+        prog: _UUIDProgress | None = None
+        if not multi:
+            prog = _UUIDProgress(label="stage3_infer", prefix=prefix, total=int(total_rows), already_done=int(done_rows))
+            prog.start()
 
-        all_rows: List[Dict[str, Any]] = []
         for r in iter_jsonl(stage3_input_path, tolerate_errors=True):
             uuid = r.get("uuid")
             if uuid is None:
                 continue
-            all_rows.append(r)
-
-        to_process = [r for r in all_rows if str(r.get("uuid")) not in infer_done]
-        prog: _UUIDProgress | None = None
-        if not multi:
-            prog = _UUIDProgress(label="stage3_infer", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
-            prog.start()
-
-        for r in to_process:
-            t0 = time.monotonic()
-            uuid = r.get("uuid")
             uuid_key = str(uuid)
+            if uuid_key in infer_done:
+                continue
+            t0 = time.monotonic()
             q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
             gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
             model_q = append_choice_map_if_any(normalize_for_model(q_raw))
@@ -1574,14 +1599,10 @@ def mode_stage3_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
             prefix = _infer_prefix_from_artifact(p, suffix="stage3_infer.stage3.jsonl")
             pfx = f"{prefix}." if prefix else ""
             stage3_status_path = os.path.join(stage3_dir, f"{pfx}status.stage3.jsonl")
-            done_map = _load_status_map(stage3_status_path)
-            uuids: List[str] = []
-            for r in iter_jsonl(p, tolerate_errors=True):
-                u = r.get("uuid")
-                if u is not None:
-                    uuids.append(str(u))
-            total_all += len(uuids)
-            done_all += sum(1 for u in uuids if u in done_map)
+            done_set = _load_done_uuid_set(stage3_status_path)
+            t_i, d_i = _count_total_and_done_uuids(input_path=p, done_uuids=done_set)
+            total_all += int(t_i)
+            done_all += int(d_i)
         overall = _UUIDProgress(label="stage3_eval", total=total_all, already_done=done_all, prefix="ALL")
         overall.start()
 
@@ -1601,7 +1622,7 @@ def mode_stage3_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
         except Exception:
             pass
 
-        stage3_done = _load_status_map(stage3_status_path)
+        stage3_done_set = _load_done_uuid_set(stage3_status_path)
         result_done: set[str] = set()
         if os.path.exists(result_path):
             for row in iter_jsonl(result_path, tolerate_errors=True):
@@ -1609,23 +1630,20 @@ def mode_stage3_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                 if u is not None:
                     result_done.add(str(u))
 
-        all_rows: List[Dict[str, Any]] = []
+        total_rows, done_rows = _count_total_and_done_uuids(input_path=stage3_infer_path, done_uuids=stage3_done_set)
+        prog: _UUIDProgress | None = None
+        if not multi:
+            prog = _UUIDProgress(label="stage3_eval", prefix=prefix, total=int(total_rows), already_done=int(done_rows))
+            prog.start()
+
         for r in iter_jsonl(stage3_infer_path, tolerate_errors=True):
             uuid = r.get("uuid")
             if uuid is None:
                 continue
-            all_rows.append(r)
-
-        to_process = [r for r in all_rows if str(r.get("uuid")) not in stage3_done]
-        prog: _UUIDProgress | None = None
-        if not multi:
-            prog = _UUIDProgress(label="stage3_eval", prefix=prefix, total=len(all_rows), already_done=len(all_rows) - len(to_process))
-            prog.start()
-
-        for r in to_process:
-            t0 = time.monotonic()
-            uuid = r.get("uuid")
             uuid_key = str(uuid)
+            if uuid_key in stage3_done_set:
+                continue
+            t0 = time.monotonic()
             q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
             gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
             model_q = r.get("model_input") if isinstance(r.get("model_input"), str) else append_choice_map_if_any(normalize_for_model(q_raw))
