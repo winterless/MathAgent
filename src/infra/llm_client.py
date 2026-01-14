@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import subprocess
 import time
 import urllib.error
@@ -245,10 +246,92 @@ class LLMClient:
                 return
             stats[key] = int(stats.get(key, 0)) + inc
 
+        # Env-driven recovery knobs (avoid changing config/llm_models.json)
+        # - MATHAGENT_LLM_WAIT_ON_CONNREFUSED_S: seconds to wait for server recovery (0 disables)
+        # - MATHAGENT_LLM_HEALTH_URL: override health endpoint (default: <base_url>/v1/models)
+        # - MATHAGENT_LLM_RESTART_CMD: optional shell command to restart vLLM (fire-and-forget)
+        # - MATHAGENT_LLM_CONNREFUSED_LOG: set to 1/true to log recovery steps to stderr
+
+        def _env_float(name: str, default: float) -> float:
+            v = os.environ.get(name)
+            if v is None:
+                return float(default)
+            try:
+                return float(str(v).strip())
+            except Exception:
+                return float(default)
+
+        def _env_str(name: str, default: str = "") -> str:
+            v = os.environ.get(name)
+            if v is None:
+                return str(default)
+            return str(v)
+
+        def _env_bool(name: str, default: bool) -> bool:
+            v = os.environ.get(name)
+            if v is None:
+                return bool(default)
+            s = str(v).strip().lower()
+            if s in ("1", "true", "yes", "y", "on", "enable", "enabled"):
+                return True
+            if s in ("0", "false", "no", "n", "off", "disable", "disabled"):
+                return False
+            return bool(default)
+
+        def _wait_for_health(*, wait_s: float, restart_cmd: str, restart_attempted: bool) -> bool:
+            wait_s = float(wait_s or 0.0)
+            if wait_s <= 0:
+                return False
+
+            log = _env_bool("MATHAGENT_LLM_CONNREFUSED_LOG", False)
+            health_url = _env_str("MATHAGENT_LLM_HEALTH_URL", "").strip()
+            if not health_url:
+                base = self.config.base_url.rstrip("/")
+                health_url = base + "/v1/models"
+
+            deadline = time.time() + wait_s
+
+            if restart_cmd and not restart_attempted:
+                if log:
+                    print(f"[LLM] connection refused; running restart cmd: {restart_cmd}", file=sys.stderr, flush=True)
+                try:
+                    subprocess.Popen(
+                        restart_cmd,
+                        shell=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception as e:
+                    if log:
+                        print(f"[LLM] restart cmd failed to spawn: {e}", file=sys.stderr, flush=True)
+
+            sleep_s = 0.5
+            while time.time() < deadline:
+                try:
+                    with urllib.request.urlopen(health_url, timeout=2) as resp:
+                        status = int(getattr(resp, "status", 200) or 200)
+                        if 200 <= status < 300:
+                            if log:
+                                print(f"[LLM] health OK: {health_url}", file=sys.stderr, flush=True)
+                            return True
+                except Exception:
+                    pass
+                time.sleep(sleep_s)
+                sleep_s = min(sleep_s * 1.5, 2.0)
+            if log:
+                print(f"[LLM] health did not recover within {wait_s:.1f}s: {health_url}", file=sys.stderr, flush=True)
+            return False
+
         backoff = max(float(self.config.retry_backoff_s), 0.0)
         attempts = max(int(self.config.retry_max), 0) + 1
         last_err: Exception | None = None
-        for attempt in range(attempts):
+
+        connrefused_wait_s = _env_float("MATHAGENT_LLM_WAIT_ON_CONNREFUSED_S", 0.0)
+        restart_cmd = _env_str("MATHAGENT_LLM_RESTART_CMD", "").strip()
+        restart_attempted = False
+
+        attempt = 0
+        while attempt < attempts:
             _bump("http_calls", 1)
             try:
                 with urllib.request.urlopen(req, timeout=self.config.timeout_s) as resp:
@@ -316,8 +399,30 @@ class LLMClient:
                     raise last_err from e
             except (TimeoutError, urllib.error.URLError) as e:
                 # URLError is a wrapper for many network issues, incl timeouts.
-                last_err = RuntimeError(f"LLM network error: {e}")
-                _bump("timeouts", 1)
+                reason = getattr(e, "reason", None)
+                err_no = getattr(reason, "errno", None)
+                if err_no == 111:
+                    # Connection refused: server not listening / crashed.
+                    _bump("errors", 1)
+                    recovered = _wait_for_health(
+                        wait_s=connrefused_wait_s,
+                        restart_cmd=restart_cmd,
+                        restart_attempted=restart_attempted,
+                    )
+                    if restart_cmd and not restart_attempted:
+                        restart_attempted = True
+                    if recovered:
+                        if stats is not None:
+                            stats["retries"] = int(stats.get("retries", 0)) + 1
+                        # Retry immediately without consuming an attempt.
+                        continue
+                    last_err = RuntimeError(
+                        f"LLM network error (connection refused). Is the server running at {url}? "
+                        f"base_url={self.config.base_url!r} model={self.config.model!r}. Original: {e}"
+                    )
+                else:
+                    last_err = RuntimeError(f"LLM network error: {e}")
+                    _bump("timeouts", 1)
                 if attempt >= attempts - 1:
                     raise last_err from e
 
@@ -328,6 +433,7 @@ class LLMClient:
                 sleep_s = backoff + (float(self.config.retry_jitter_s) if attempt % 2 == 0 else 0.0)
                 time.sleep(max(sleep_s, 0.0))
             backoff *= max(float(self.config.retry_backoff_mult), 1.0)
+            attempt += 1
 
         if last_err is not None:
             raise RuntimeError(f"LLM failed after retries: stage={stage_name!r}") from last_err

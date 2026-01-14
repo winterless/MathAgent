@@ -26,6 +26,28 @@ python src/run_pipeline.py --input datasets/example_input.jsonl --out datasets/o
 Optional flags:
 - `--sleep`: seconds to sleep between LLM calls (rate limit)
 
+## vLLM connection refused auto-recovery (no config changes)
+
+If your vLLM server occasionally crashes/restarts (common under very long generations), the client may raise:
+
+- `RuntimeError: LLM network error: <urlopen error [Errno 111] Connection refused>`
+
+This means **the server is not listening** on `base_url` at that moment. Without changing `config/llm_models.json`,
+you can enable a best-effort recovery mechanism via environment variables (implemented in `src/infra/llm_client.py`):
+
+- `MATHAGENT_LLM_WAIT_ON_CONNREFUSED_S`: seconds to wait for the server to come back (default `0`, disabled)
+- `MATHAGENT_LLM_RESTART_CMD`: optional shell command to restart vLLM (run at most once per request on connection refused)
+- `MATHAGENT_LLM_HEALTH_URL`: optional health check URL (default: `<base_url>/v1/models`)
+- `MATHAGENT_LLM_CONNREFUSED_LOG`: set to `1` to print recovery logs to stderr
+
+Example (recommended if you already run vLLM under systemd/docker restart policies; just wait for recovery):
+
+```bash
+export MATHAGENT_LLM_WAIT_ON_CONNREFUSED_S=120
+export MATHAGENT_LLM_CONNREFUSED_LOG=1
+PYTHONPATH=src python3 src/run_pipeline.py --input datasets/example_input.jsonl --out datasets/out/demo --llm-config config/llm_models.json
+```
+
 Outputs (all JSONL) are written under `--out`.
 
 Per input file, artifacts are always **prefixed by the input filename stem**:
