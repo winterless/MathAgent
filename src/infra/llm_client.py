@@ -13,6 +13,21 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 
+_RESTART_LOCK = threading.Lock()
+_LAST_RESTART_TS = 0.0
+
+
+@dataclass
+class RecoveryConfig:
+    wait_on_connrefused_s: float = 0.0
+    health_url: str = ""
+    restart_cmd: str = ""
+    connrefused_log: bool = False
+    restart_on_connrefused: bool = False
+    restart_on_runtime_error: bool = False
+    restart_cooldown_s: float = 30.0
+
+
 @dataclass(frozen=True)
 class LLMConfig:
     """
@@ -65,6 +80,10 @@ class LLMConfig:
 class LLMClient:
     def __init__(self, *, config: LLMConfig) -> None:
         self.config = config
+        self.recovery = RecoveryConfig()
+
+    def set_recovery_config(self, cfg: RecoveryConfig) -> None:
+        self.recovery = cfg
 
     def _has_py_script(self) -> bool:
         return bool((self.config.py_script or "").strip())
@@ -246,64 +265,35 @@ class LLMClient:
                 return
             stats[key] = int(stats.get(key, 0)) + inc
 
-        # Env-driven recovery knobs (avoid changing config/llm_models.json)
-        # - MATHAGENT_LLM_WAIT_ON_CONNREFUSED_S: seconds to wait for server recovery (0 disables)
-        # - MATHAGENT_LLM_HEALTH_URL: override health endpoint (default: <base_url>/v1/models)
-        # - MATHAGENT_LLM_RESTART_CMD: optional shell command to restart vLLM (fire-and-forget)
-        # - MATHAGENT_LLM_CONNREFUSED_LOG: set to 1/true to log recovery steps to stderr
-
-        def _env_float(name: str, default: float) -> float:
-            v = os.environ.get(name)
-            if v is None:
-                return float(default)
+        def _spawn_restart(cmd: str, *, log: bool = False) -> None:
+            if not cmd:
+                return
+            if log:
+                print(f"[LLM] running restart cmd: {cmd}", file=sys.stderr, flush=True)
             try:
-                return float(str(v).strip())
-            except Exception:
-                return float(default)
-
-        def _env_str(name: str, default: str = "") -> str:
-            v = os.environ.get(name)
-            if v is None:
-                return str(default)
-            return str(v)
-
-        def _env_bool(name: str, default: bool) -> bool:
-            v = os.environ.get(name)
-            if v is None:
-                return bool(default)
-            s = str(v).strip().lower()
-            if s in ("1", "true", "yes", "y", "on", "enable", "enabled"):
-                return True
-            if s in ("0", "false", "no", "n", "off", "disable", "disabled"):
-                return False
-            return bool(default)
+                subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                if log:
+                    print(f"[LLM] restart cmd failed to spawn: {e}", file=sys.stderr, flush=True)
+                return
 
         def _wait_for_health(*, wait_s: float, restart_cmd: str, restart_attempted: bool) -> bool:
             wait_s = float(wait_s or 0.0)
             if wait_s <= 0:
                 return False
 
-            log = _env_bool("MATHAGENT_LLM_CONNREFUSED_LOG", False)
-            health_url = _env_str("MATHAGENT_LLM_HEALTH_URL", "").strip()
+            log = bool(self.recovery.connrefused_log)
+            health_url = (self.recovery.health_url or "").strip()
             if not health_url:
                 base = self.config.base_url.rstrip("/")
                 health_url = base + "/v1/models"
 
             deadline = time.time() + wait_s
 
-            if restart_cmd and not restart_attempted:
+            if restart_cmd and not restart_attempted and self.recovery.restart_on_connrefused:
                 if log:
-                    print(f"[LLM] connection refused; running restart cmd: {restart_cmd}", file=sys.stderr, flush=True)
-                try:
-                    subprocess.Popen(
-                        restart_cmd,
-                        shell=True,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                except Exception as e:
-                    if log:
-                        print(f"[LLM] restart cmd failed to spawn: {e}", file=sys.stderr, flush=True)
+                    print("[LLM] connection refused; restarting...", file=sys.stderr, flush=True)
+                _spawn_restart(restart_cmd, log=log)
 
             sleep_s = 0.5
             while time.time() < deadline:
@@ -326,8 +316,8 @@ class LLMClient:
         attempts = max(int(self.config.retry_max), 0) + 1
         last_err: Exception | None = None
 
-        connrefused_wait_s = _env_float("MATHAGENT_LLM_WAIT_ON_CONNREFUSED_S", 0.0)
-        restart_cmd = _env_str("MATHAGENT_LLM_RESTART_CMD", "").strip()
+        connrefused_wait_s = float(self.recovery.wait_on_connrefused_s or 0.0)
+        restart_cmd = (self.recovery.restart_cmd or "").strip()
         restart_attempted = False
 
         attempt = 0
@@ -409,7 +399,7 @@ class LLMClient:
                         restart_cmd=restart_cmd,
                         restart_attempted=restart_attempted,
                     )
-                    if restart_cmd and not restart_attempted:
+                    if restart_cmd and not restart_attempted and self.recovery.restart_on_connrefused:
                         restart_attempted = True
                     if recovered:
                         if stats is not None:
@@ -476,6 +466,27 @@ class LLMClient:
         def _safe_print_locked(*args: Any, **kwargs: Any) -> None:
             with print_lock:
                 _safe_print(*args, **kwargs)
+
+        def _maybe_restart_on_runtime_error(err_text: str) -> None:
+            """
+            Best-effort restart when outputs contain runtime-like errors.
+            """
+            if not self.recovery.restart_on_runtime_error:
+                return
+            cmd = (self.recovery.restart_cmd or "").strip()
+            if not cmd:
+                return
+            text = (err_text or "").lower()
+            if "runtimeerror" not in text and "runtime error" not in text and "llm httperror" not in text:
+                return
+            cooldown_s = float(self.recovery.restart_cooldown_s or 30.0)
+            now = time.time()
+            with _RESTART_LOCK:
+                global _LAST_RESTART_TS
+                if now - _LAST_RESTART_TS < cooldown_s:
+                    return
+                _LAST_RESTART_TS = now
+            _spawn_restart(cmd, log=False)
 
         mode = (prompt_mode or "problem").strip().lower()
         if mode in ("raw_prompt", "raw_prompt_eval"):
@@ -649,6 +660,7 @@ class LLMClient:
             except Exception as e:
                 # Keep pipeline moving; caller can treat this as an incorrect attempt.
                 err_text = f"[LLM_ERROR stage={stage_name}]: {type(e).__name__}: {e}"
+                _maybe_restart_on_runtime_error(err_text)
                 answers[i] = err_text
                 if local_stats is not None:
                     local_stats["errors"] = int(local_stats.get("errors", 0)) + 1

@@ -6,7 +6,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from infra.llm_client import LLMClient, LLMConfig
+from infra.llm_client import LLMClient, LLMConfig, RecoveryConfig
 
 
 @dataclass(frozen=True)
@@ -148,6 +148,8 @@ class LLMRouter:
         if default_name not in self._clients:
             raise ValueError(f"Invalid llm config: routes.default={default_name} is not defined in models")
 
+        self._apply_recovery_config()
+
     def stage_params(self, stage_name: str) -> StageParams:
         """
         Get per-stage generation params.
@@ -196,6 +198,35 @@ class LLMRouter:
             return int(v)
         except Exception:
             return int(default)
+
+    def _apply_recovery_config(self) -> None:
+        """
+        Build recovery settings from options and apply to all clients.
+        This avoids env var dependency.
+        """
+        start_cmd = str(self._options.get("vllm_start_cmd") or "").strip()
+        stop_cmd = str(self._options.get("vllm_stop_cmd") or "").strip()
+        restart_cmd = str(self._options.get("vllm_restart_cmd") or "").strip()
+        if not restart_cmd:
+            if stop_cmd and start_cmd:
+                restart_cmd = f"{stop_cmd}; {start_cmd}"
+            else:
+                restart_cmd = start_cmd
+
+        wait_s = self.option_int("vllm_wait_s", 0)
+        health_url = str(self._options.get("vllm_health_url") or "").strip()
+
+        cfg = RecoveryConfig(
+            wait_on_connrefused_s=float(wait_s),
+            health_url=health_url,
+            restart_cmd=restart_cmd,
+            connrefused_log=self.option_bool("vllm_connrefused_log", False),
+            restart_on_connrefused=self.option_bool("vllm_restart_on_connrefused", False),
+            restart_on_runtime_error=self.option_bool("vllm_restart_on_runtime_error", False),
+            restart_cooldown_s=float(self.option_int("vllm_restart_cooldown_s", 30)),
+        )
+        for c in self._clients.values():
+            c.set_recovery_config(cfg)
 
     def default_base_url(self) -> str:
         """

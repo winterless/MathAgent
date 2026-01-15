@@ -78,6 +78,11 @@
     "vllm_connrefused_log": true,
     "vllm_start_with_bash": true,
     "vllm_log_path": "/tmp/mathagent_vllm.log",
+    "vllm_restart_on_runtime_error": true,
+    "vllm_restart_cooldown_s": 30,
+    "vllm_shutdown_on_exit": true,
+    "vllm_stop_cmd": "pkill -f vllm.entrypoints.openai.api_server || true",
+    "purge_conn_errors_on_start": true,
     "think_tag_default": "",
     "think_tag_by_profile": {
       "base": "",

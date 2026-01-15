@@ -26,27 +26,14 @@ python src/run_pipeline.py --input datasets/example_input.jsonl --out datasets/o
 Optional flags:
 - `--sleep`: seconds to sleep between LLM calls (rate limit)
 
-## vLLM connection refused auto-recovery (no config changes)
+## vLLM auto-recovery (config-based)
 
 If your vLLM server occasionally crashes/restarts (common under very long generations), the client may raise:
 
 - `RuntimeError: LLM network error: <urlopen error [Errno 111] Connection refused>`
 
-This means **the server is not listening** on `base_url` at that moment. Without changing `config/llm_models.json`,
-you can enable a best-effort recovery mechanism via environment variables (implemented in `src/infra/llm_client.py`):
-
-- `MATHAGENT_LLM_WAIT_ON_CONNREFUSED_S`: seconds to wait for the server to come back (default `0`, disabled)
-- `MATHAGENT_LLM_RESTART_CMD`: optional shell command to restart vLLM (run at most once per request on connection refused)
-- `MATHAGENT_LLM_HEALTH_URL`: optional health check URL (default: `<base_url>/v1/models`)
-- `MATHAGENT_LLM_CONNREFUSED_LOG`: set to `1` to print recovery logs to stderr
-
-Example (recommended if you already run vLLM under systemd/docker restart policies; just wait for recovery):
-
-```bash
-export MATHAGENT_LLM_WAIT_ON_CONNREFUSED_S=120
-export MATHAGENT_LLM_CONNREFUSED_LOG=1
-PYTHONPATH=src python3 src/run_pipeline.py --input datasets/example_input.jsonl --out datasets/out/demo --llm-config config/llm_models.json
-```
+This means **the server is not listening** on `base_url` at that moment. Recovery is configured via
+`config/llm_models.json` under `options` (no environment variables required).
 
 ## vLLM auto-start from config (no external script)
 
@@ -74,6 +61,12 @@ Notes:
 - `vllm_health_url` can be left empty to use `<base_url>/v1/models`.
 - `vllm_start_with_bash=true` runs the command via `bash -lc` (useful for conda/venv activation).
 - `vllm_log_path` captures vLLM stdout/stderr for troubleshooting (default `/tmp/mathagent_vllm.log`).
+- `vllm_restart_on_runtime_error=true` restarts vLLM when outputs contain runtime-like errors (e.g. `LLM HTTPError 503`).
+- `vllm_restart_cooldown_s` throttles restarts to avoid loops.
+- `vllm_restart_cmd` can include both stop + start (e.g. `pkill ...; python -m vllm.entrypoints.openai.api_server ...`).
+- If `vllm_restart_cmd` is empty, the pipeline automatically combines `vllm_stop_cmd; vllm_start_cmd`.
+- `vllm_shutdown_on_exit=true` stops vLLM when the pipeline exits (uses `vllm_stop_cmd`).
+- `vllm_stop_cmd` should be a safe stop command for your environment (e.g. `pkill -f vllm.entrypoints.openai.api_server`).
 
 ## Startup cleanup: remove rows with connection errors so reruns can reprocess them
 
@@ -88,11 +81,7 @@ By default, `src/run_pipeline.py` performs a best-effort cleanup on startup:
 
 It does **not** delete task lists (`stage2_input.stage2.jsonl`, `stage3_input.stage3.jsonl`), nor `stage1_output.stage1.jsonl`, nor `stage0` copies.
 
-To disable this behavior:
-
-```bash
-export MATHAGENT_DISABLE_PURGE_CONN_ERRORS=1
-```
+To disable this behavior, set `options.purge_conn_errors_on_start=false` in `config/llm_models.json`.
 
 Outputs (all JSONL) are written under `--out`.
 

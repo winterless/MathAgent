@@ -16,6 +16,7 @@ import re
 import subprocess
 import urllib.request
 import urllib.error
+import atexit
 from typing import Any, Dict, List
 
 from core.prompt_assemble import assemble_stored_prompt
@@ -94,41 +95,16 @@ def _wait_for_health(url: str, wait_s: float) -> bool:
     return False
 
 
-def _configure_vllm_recovery_envs(llm: LLMRouter) -> None:
-    """
-    Map config options to env vars used by LLMClient recovery logic.
-    This keeps behavior configurable via config/llm_models.json only.
-    """
-    cmd = llm.option_str("vllm_start_cmd", "").strip()
-    if cmd and llm.option_bool("vllm_restart_on_connrefused", False):
-        os.environ.setdefault("MATHAGENT_LLM_RESTART_CMD", cmd)
-
-    wait_s = _parse_float(llm.option_str("vllm_wait_s", "0"), 0.0)
-    if wait_s > 0:
-        os.environ.setdefault("MATHAGENT_LLM_WAIT_ON_CONNREFUSED_S", str(wait_s))
-
-    health_url = llm.option_str("vllm_health_url", "").strip()
-    if not health_url:
-        base = llm.default_base_url().strip()
-        if base:
-            health_url = base.rstrip("/") + "/v1/models"
-    if health_url:
-        os.environ.setdefault("MATHAGENT_LLM_HEALTH_URL", health_url)
-
-    if llm.option_bool("vllm_connrefused_log", False):
-        os.environ.setdefault("MATHAGENT_LLM_CONNREFUSED_LOG", "1")
-
-
-def _maybe_autostart_vllm(llm: LLMRouter) -> None:
+def _maybe_autostart_vllm(llm: LLMRouter) -> bool:
     """
     If enabled in config, start vLLM on pipeline startup and wait for health.
     """
     if not llm.option_bool("vllm_autostart", False):
-        return
+        return False
 
     cmd = llm.option_str("vllm_start_cmd", "").strip()
     if not cmd:
-        return
+        return False
 
     health_url = llm.option_str("vllm_health_url", "").strip()
     if not health_url:
@@ -140,7 +116,7 @@ def _maybe_autostart_vllm(llm: LLMRouter) -> None:
 
     # If already healthy, skip.
     if health_url and _health_ok(health_url, timeout_s=2.0):
-        return
+        return False
 
     log_path = llm.option_str("vllm_log_path", "").strip()
     if not log_path:
@@ -169,12 +145,25 @@ def _maybe_autostart_vllm(llm: LLMRouter) -> None:
             )
     except Exception as e:
         print(f"[WARN] vLLM autostart failed to spawn: {e}", file=sys.stderr, flush=True)
-        return
+        return False
 
     if health_url and wait_s > 0:
         ok = _wait_for_health(health_url, wait_s)
         if not ok:
             print(f"[WARN] vLLM autostart did not become healthy within {wait_s:.1f}s: {health_url}", file=sys.stderr, flush=True)
+    return True
+
+
+def _maybe_shutdown_vllm(llm: LLMRouter) -> None:
+    if not llm.option_bool("vllm_shutdown_on_exit", False):
+        return
+    cmd = llm.option_str("vllm_stop_cmd", "").strip()
+    if not cmd:
+        return
+    try:
+        subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        return
 
 
 def _contains_conn_error_marker(obj: Any, *, max_nodes: int = 5000) -> bool:
@@ -2918,8 +2907,8 @@ def main() -> None:
     os.makedirs(stage3_dir, exist_ok=True)
 
     # ---- Startup cleanup: purge connection-error rows so reruns can reprocess those uuids ----
-    # Default: enabled. Disable by setting MATHAGENT_DISABLE_PURGE_CONN_ERRORS=1.
-    if not _env_bool("MATHAGENT_DISABLE_PURGE_CONN_ERRORS", False):
+    # Default: enabled; toggle via config option `purge_conn_errors_on_start`.
+    if llm.option_bool("purge_conn_errors_on_start", True):
         bad = _scan_bad_uuids_for_conn_errors(str(args.out))
         if bad:
             removed = _purge_uuids_from_out_dir(str(args.out), bad)
@@ -2927,15 +2916,17 @@ def main() -> None:
             total_removed = sum(int(v) for v in removed.values())
             print(
                 f"[CLEAN] Purged {len(bad)} uuid(s) with connection errors from {len(removed)} file(s); "
-                f"removed_lines={total_removed}. Set MATHAGENT_DISABLE_PURGE_CONN_ERRORS=1 to disable.",
+                f"removed_lines={total_removed}. Disable via options.purge_conn_errors_on_start=false.",
                 file=sys.stderr,
                 flush=True,
             )
 
     llm = LLMRouter(config_path=args.llm_config)
     min_votes_to_accept = llm.threshold_int("min_votes_to_accept", 5)
-    _configure_vllm_recovery_envs(llm)
-    _maybe_autostart_vllm(llm)
+    started_by_us = _maybe_autostart_vllm(llm)
+    if llm.option_bool("vllm_shutdown_on_exit", False):
+        # Always honor shutdown_on_exit; if you only want to stop when we started it, set vllm_stop_cmd accordingly.
+        atexit.register(_maybe_shutdown_vllm, llm)
 
     # ---- Route-A modular modes ----
     if mode != "full":
