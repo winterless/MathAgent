@@ -554,6 +554,7 @@ MODES = [
     "stage2_eval",
     "stage3_infer",
     "stage3_eval",
+    "result_rebuild",
 ]
 
 
@@ -852,6 +853,106 @@ def _to_result_entry(*, stage: str, final_answer: str, entry: Dict[str, Any]) ->
         "majority_answer": entry.get("majority_answer"),
         "attempts": attempts_slim,
     }
+
+
+def _result_path_for_prefix(out_dir: str, prefix: str) -> str:
+    result_dir = os.path.join(out_dir, "result")
+    os.makedirs(result_dir, exist_ok=True)
+    pfx = f"{prefix}." if prefix else ""
+    return os.path.join(result_dir, f"{pfx}result.stage_final.jsonl")
+
+
+def result_rebuild(*, out_dir: str, min_votes_to_accept: int) -> None:
+    """
+    Scan output artifacts under out_dir and (re)build result/*.result.stage_final.jsonl.
+    Only include rows that:
+      - have majority_count >= min_votes_to_accept
+      - contain an attempt whose answer matches the majority answer
+    Result rows only include: {"uuid", "text"} (text is raw_text of the matching attempt).
+    Sources:
+      - accepted_bank.stage_final.jsonl
+      - stage2_archive.stage2.jsonl
+      - stage3_archive.stage3.jsonl
+    """
+    out_dir = str(out_dir)
+    accepted_paths = _iter_artifacts(out_dir, suffix="accepted_bank.stage_final.jsonl")
+    stage2_paths = _iter_artifacts(out_dir, suffix="stage2_archive.stage2.jsonl")
+    stage3_paths = _iter_artifacts(out_dir, suffix="stage3_archive.stage3.jsonl")
+    all_paths = accepted_paths + stage2_paths + stage3_paths
+
+    # Cache existing result uuids per prefix
+    existing: Dict[str, set[str]] = {}
+
+    def _get_done(prefix: str) -> set[str]:
+        if prefix in existing:
+            return existing[prefix]
+        result_path = _result_path_for_prefix(out_dir, prefix)
+        done = _load_done_uuid_set(result_path)
+        existing[prefix] = done
+        return done
+
+    def _extract_text_if_majority(row: Dict[str, Any]) -> str | None:
+        maj = row.get("majority_answer") if isinstance(row.get("majority_answer"), dict) else {}
+        maj_ans = str((maj or {}).get("majority") or "").strip()
+        try:
+            maj_cnt = int((maj or {}).get("majority_count") or 0)
+        except Exception:
+            maj_cnt = 0
+        if not maj_ans or maj_cnt < int(min_votes_to_accept):
+            return None
+        attempts = row.get("attempts") if isinstance(row.get("attempts"), list) else []
+        for a in attempts:
+            if not isinstance(a, dict):
+                continue
+            raw = a.get("raw_text")
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            cand_list = [
+                a.get("normalized_answer"),
+                a.get("extracted_answer"),
+                a.get("boxed_answer"),
+            ]
+            for cand in cand_list:
+                if not isinstance(cand, str):
+                    continue
+                c = cand.strip()
+                if not c:
+                    continue
+                if _as_choice_letter(c) == _as_choice_letter(maj_ans) or c == maj_ans:
+                    return raw
+        return None
+
+    for pth in all_paths:
+        base = os.path.basename(pth)
+        if base.endswith("accepted_bank.stage_final.jsonl"):
+            prefix = _infer_prefix_from_artifact(pth, suffix="accepted_bank.stage_final.jsonl")
+            stage = None
+        elif base.endswith("stage2_archive.stage2.jsonl"):
+            prefix = _infer_prefix_from_artifact(pth, suffix="stage2_archive.stage2.jsonl")
+            stage = "stage2"
+        elif base.endswith("stage3_archive.stage3.jsonl"):
+            prefix = _infer_prefix_from_artifact(pth, suffix="stage3_archive.stage3.jsonl")
+            stage = "stage3"
+        else:
+            continue
+
+        result_path = _result_path_for_prefix(out_dir, prefix)
+        done = _get_done(prefix)
+
+        for row in iter_jsonl(pth, tolerate_errors=True):
+            if not isinstance(row, dict):
+                continue
+            u = row.get("uuid")
+            if u is None:
+                continue
+            u_str = str(u)
+            if u_str in done:
+                continue
+            raw_text = _extract_text_if_majority(row)
+            if raw_text is None:
+                continue
+            append_jsonl_line(result_path, {"uuid": u, "text": raw_text})
+            done.add(u_str)
 
 
 def mode_stage1_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_to_accept: int, sleep_s: float) -> List[str]:
@@ -1890,22 +1991,9 @@ def mode_stage3_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
         stage3_status_path = os.path.join(stage3_dir, f"{pfx}status.stage3.jsonl")
 
         accepted_bank_path = os.path.join(out_dir, f"{pfx}accepted_bank.stage_final.jsonl")
-        result_dir = os.path.join(out_dir, "result")
-        os.makedirs(result_dir, exist_ok=True)
-        result_path = os.path.join(result_dir, f"{pfx}result.stage_final.jsonl")
-        try:
-            open(result_path, "a", encoding="utf-8").close()
-        except Exception:
-            pass
+        result_path = os.path.join(out_dir, "result", f"{pfx}result.stage_final.jsonl")
 
         stage3_done_set = _load_done_uuid_set(stage3_status_path)
-        result_done: set[str] = set()
-        if os.path.exists(result_path):
-            for row in iter_jsonl(result_path, tolerate_errors=True):
-                u = row.get("uuid")
-                if u is not None:
-                    result_done.add(str(u))
-
         total_rows, done_rows = _count_total_and_done_uuids(input_path=stage3_infer_path, done_uuids=stage3_done_set)
         prog: _UUIDProgress | None = None
         if not multi:
@@ -2006,9 +2094,6 @@ def mode_stage3_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
             append_jsonl_line(stage3_archive_path, entry)
             accepted_from = "stage3" if sel3.get("final_source") == "majority" else "stage3_gold_fallback"
             append_jsonl_line(accepted_bank_path, {**entry, **sel3, "accepted_from": accepted_from})
-            if sel3.get("final_source") == "majority" and uuid_key not in result_done:
-                append_jsonl_line(result_path, _to_result_entry(stage="stage3", final_answer=str(sel3.get("final_answer") or ""), entry=entry))
-                result_done.add(uuid_key)
             append_jsonl_line(
                 stage3_status_path,
                 {
@@ -2077,89 +2162,12 @@ def _run_one_input(
     stage3_status_path = os.path.join(stage3_dir, f"{pfx}status.stage3.jsonl")
 
     accepted_bank_path = os.path.join(out_dir, f"{pfx}accepted_bank.stage_final.jsonl")
-
-    result_dir = os.path.join(out_dir, "result")
-    os.makedirs(result_dir, exist_ok=True)
-    result_path = os.path.join(result_dir, f"{pfx}result.stage_final.jsonl")
-    # Ensure each input file (prefix) produces a corresponding result file (even if empty).
-    try:
-        open(result_path, "a", encoding="utf-8").close()
-    except Exception:
-        pass
-    # Sanitize legacy result files:
-    # - result should only contain stage2/stage3 vote-based results.
-    # - upgrade legacy schema (voted_answer/selected_*) to the current schema (final_answer/final_*),
-    #   and recompute attempt verdicts as (boxed_answer == final_answer) when possible.
-    try:
-        if os.path.exists(result_path) and os.path.getsize(result_path) > 0:
-            kept: List[Dict[str, Any]] = []
-            changed = False
-            def _choice_letter_for_upgrade(s: str) -> str:
-                ss = (s or "").strip()
-                if not ss:
-                    return ""
-                c0 = ss[0].upper()
-                if c0 in ("A", "B", "C", "D"):
-                    return c0
-                return ss
-            for row in iter_jsonl(result_path, tolerate_errors=True):
-                st = str(row.get("stage") or "")
-                if st in ("stage2", "stage3"):
-                    if isinstance(row, dict):
-                        # Upgrade legacy top-level field name.
-                        if "final_answer" not in row and "voted_answer" in row:
-                            row["final_answer"] = row.get("voted_answer")
-                            try:
-                                del row["voted_answer"]
-                            except Exception:
-                                pass
-                            changed = True
-
-                        # Upgrade attempts field name and recompute verdicts if possible.
-                        attempts = row.get("attempts")
-                        if isinstance(attempts, list):
-                            fa = str(row.get("final_answer") or "").strip()
-                            for a in attempts:
-                                if not isinstance(a, dict):
-                                    continue
-                                if "final_answer" not in a and "voted_answer" in a:
-                                    a["final_answer"] = a.get("voted_answer")
-                                    try:
-                                        del a["voted_answer"]
-                                    except Exception:
-                                        pass
-                                    changed = True
-                                boxed = a.get("boxed_answer")
-                                boxed = boxed.strip() if isinstance(boxed, str) else str(boxed).strip()
-                                if boxed and fa:
-                                    verdict = "正确" if (_choice_letter_for_upgrade(boxed) == _choice_letter_for_upgrade(fa) or boxed == fa) else "错误"
-                                else:
-                                    verdict = "不确定"
-                                if a.get("verdict") != verdict:
-                                    a["verdict"] = verdict
-                                    changed = True
-
-                    kept.append(row)
-                else:
-                    changed = True
-            if changed:
-                write_jsonl_atomic(result_path, kept)
-    except Exception:
-        # Best-effort; do not fail pipeline for result cleanup.
-        pass
+    result_path = os.path.join(out_dir, "result", f"{pfx}result.stage_final.jsonl")
 
     # ---- Resume bookkeeping ----
     stage1_done = _load_status_map(stage1_status_path)
     stage2_done = _load_status_map(stage2_status_path)
     stage3_done = _load_status_map(stage3_status_path)
-
-    # ---- Result bookkeeping (per uuid, per input/prefix) ----
-    result_done: set[str] = set()
-    if os.path.exists(result_path):
-        for row in iter_jsonl(result_path, tolerate_errors=True):
-            u = row.get("uuid")
-            if u is not None:
-                result_done.add(str(u))
 
     def _to_result_entry(*, stage: str, final_answer: str, entry: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -2494,24 +2502,6 @@ def _run_one_input(
             if u is not None:
                 accepted_done.add(str(u))
 
-    # Backfill result archive from accepted_bank (useful for resume or re-run with result dir missing).
-    if os.path.exists(accepted_bank_path):
-        for row in iter_jsonl(accepted_bank_path, tolerate_errors=True):
-            u = row.get("uuid")
-            if u is None:
-                continue
-            u_str = str(u)
-            if u_str in result_done:
-                continue
-            if (row.get("final_source") or "") != "majority":
-                continue
-            accepted_from = str(row.get("accepted_from") or "")
-            if accepted_from not in ("stage2", "stage3"):
-                continue
-            stage = accepted_from
-            final_answer = str(row.get("final_answer") or "").strip()
-            append_jsonl_line(result_path, _to_result_entry(stage=stage, final_answer=final_answer, entry=row))
-            result_done.add(u_str)
     # IMPORTANT: Do NOT backfill Stage1-accepted UUIDs into accepted_bank.
 
     hard_rows: List[Dict[str, Any]] = []
@@ -2651,9 +2641,6 @@ def _run_one_input(
         next_stage = "stage3" if int(stage2_majority_answer["majority_count"]) < int(min_votes_to_accept) else "accepted"
         if next_stage == "accepted":
             append_jsonl_line(accepted_bank_path, {**entry, **sel2, "accepted_from": "stage2"})
-            if sel2.get("final_source") == "majority" and uuid_key not in result_done:
-                append_jsonl_line(result_path, _to_result_entry(stage="stage2", final_answer=str(sel2.get("final_answer") or ""), entry=entry))
-                result_done.add(uuid_key)
         append_jsonl_line(
             stage2_status_path,
             {
@@ -2812,9 +2799,6 @@ def _run_one_input(
         next_stage = "accepted"
         accepted_from = "stage3" if sel3.get("final_source") == "majority" else "stage3_gold_fallback"
         append_jsonl_line(accepted_bank_path, {**entry, **sel3, "accepted_from": accepted_from})
-        if sel3.get("final_source") == "majority" and uuid_key not in result_done:
-            append_jsonl_line(result_path, _to_result_entry(stage="stage3", final_answer=str(sel3.get("final_answer") or ""), entry=entry))
-            result_done.add(uuid_key)
         append_jsonl_line(
             stage3_status_path,
             {
@@ -2935,6 +2919,13 @@ def main() -> None:
     # ---- Route-A modular modes ----
     if mode != "full":
         assert args.input
+        if mode == "result_rebuild":
+            # Rebuild results from existing artifacts; uses --input as out_dir.
+            result_rebuild(out_dir=str(args.input), min_votes_to_accept=min_votes_to_accept)
+            print("Done.")
+            print(f"- mode: {mode}")
+            print(f"- out_dir: {args.input}")
+            return
         if mode == "stage1_infer":
             outs = mode_stage1_infer(
                 input_arg=args.input,

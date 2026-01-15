@@ -102,6 +102,21 @@ This repo also supports **modular execution** via `--mode`, so you can run only 
 
 Note: the project uses `src/` as import root, so we recommend running with `PYTHONPATH=src`.
 
+### Rebuild result/ from existing artifacts
+
+If you already have `accepted_bank` / `stage2_archive` / `stage3_archive` and want to regenerate `result/*.result.stage_final.jsonl`:
+
+```bash
+PYTHONPATH=src python3 src/run_pipeline.py \
+  --mode result_rebuild \
+  --input datasets/out/demo_modular
+```
+
+Rebuild rules:
+- Only include rows with `majority_count >= min_votes_to_accept`
+- Only include rows where one attempt matches the majority answer
+- Result schema: `{"uuid": ..., "text": "<raw_text>"}` (raw_text from the matching attempt)
+
 ### Stage1: infer -> eval
 
 Stage1 infer (produce raw solve outputs only):
