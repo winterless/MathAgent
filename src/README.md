@@ -48,6 +48,33 @@ export MATHAGENT_LLM_CONNREFUSED_LOG=1
 PYTHONPATH=src python3 src/run_pipeline.py --input datasets/example_input.jsonl --out datasets/out/demo --llm-config config/llm_models.json
 ```
 
+## vLLM auto-start from config (no external script)
+
+You can optionally configure auto-start and recovery **inside `config/llm_models.json`** under `options`.
+This reuses the same start command when a connection-refused error happens.
+
+Example:
+
+```json
+{
+  "options": {
+    "vllm_autostart": true,
+    "vllm_start_cmd": "python -m vllm.entrypoints.openai.api_server --model \"/path/to/model\" --served-model-name Qwen3-8B --dtype auto --tensor-parallel-size 1 --max-model-len 32384 --gpu-memory-utilization 0.85 --swap-space 8 --port 8000",
+    "vllm_wait_s": 60,
+    "vllm_health_url": "http://127.0.0.1:8000/v1/models",
+    "vllm_restart_on_connrefused": true,
+    "vllm_connrefused_log": true
+  }
+}
+```
+
+Notes:
+- `vllm_autostart=true` launches the command at pipeline startup if health check is not OK.
+- `vllm_restart_on_connrefused=true` reuses the same command on `Errno 111` recovery.
+- `vllm_health_url` can be left empty to use `<base_url>/v1/models`.
+- `vllm_start_with_bash=true` runs the command via `bash -lc` (useful for conda/venv activation).
+- `vllm_log_path` captures vLLM stdout/stderr for troubleshooting (default `/tmp/mathagent_vllm.log`).
+
 ## Startup cleanup: remove rows with connection errors so reruns can reprocess them
 
 If some produced artifacts contain connection-related LLM error markers (e.g. `[LLM_ERROR ... connection refused ...]`),

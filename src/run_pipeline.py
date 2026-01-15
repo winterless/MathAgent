@@ -13,6 +13,9 @@ import shutil
 import sys
 import time
 import re
+import subprocess
+import urllib.request
+import urllib.error
 from typing import Any, Dict, List
 
 from core.prompt_assemble import assemble_stored_prompt
@@ -58,6 +61,120 @@ def _env_bool(name: str, default: bool) -> bool:
     if s in ("0", "false", "no", "n", "off", "disable", "disabled"):
         return False
     return bool(default)
+
+
+def _parse_float(s: Any, default: float) -> float:
+    try:
+        return float(s)
+    except Exception:
+        return float(default)
+
+
+def _health_ok(url: str, timeout_s: float = 2.0) -> bool:
+    if not url:
+        return False
+    try:
+        with urllib.request.urlopen(url, timeout=float(timeout_s)) as resp:
+            status = int(getattr(resp, "status", 200) or 200)
+            return 200 <= status < 300
+    except Exception:
+        return False
+
+
+def _wait_for_health(url: str, wait_s: float) -> bool:
+    if not url or wait_s <= 0:
+        return False
+    deadline = time.time() + float(wait_s)
+    sleep_s = 0.5
+    while time.time() < deadline:
+        if _health_ok(url, timeout_s=2.0):
+            return True
+        time.sleep(sleep_s)
+        sleep_s = min(sleep_s * 1.5, 2.0)
+    return False
+
+
+def _configure_vllm_recovery_envs(llm: LLMRouter) -> None:
+    """
+    Map config options to env vars used by LLMClient recovery logic.
+    This keeps behavior configurable via config/llm_models.json only.
+    """
+    cmd = llm.option_str("vllm_start_cmd", "").strip()
+    if cmd and llm.option_bool("vllm_restart_on_connrefused", False):
+        os.environ.setdefault("MATHAGENT_LLM_RESTART_CMD", cmd)
+
+    wait_s = _parse_float(llm.option_str("vllm_wait_s", "0"), 0.0)
+    if wait_s > 0:
+        os.environ.setdefault("MATHAGENT_LLM_WAIT_ON_CONNREFUSED_S", str(wait_s))
+
+    health_url = llm.option_str("vllm_health_url", "").strip()
+    if not health_url:
+        base = llm.default_base_url().strip()
+        if base:
+            health_url = base.rstrip("/") + "/v1/models"
+    if health_url:
+        os.environ.setdefault("MATHAGENT_LLM_HEALTH_URL", health_url)
+
+    if llm.option_bool("vllm_connrefused_log", False):
+        os.environ.setdefault("MATHAGENT_LLM_CONNREFUSED_LOG", "1")
+
+
+def _maybe_autostart_vllm(llm: LLMRouter) -> None:
+    """
+    If enabled in config, start vLLM on pipeline startup and wait for health.
+    """
+    if not llm.option_bool("vllm_autostart", False):
+        return
+
+    cmd = llm.option_str("vllm_start_cmd", "").strip()
+    if not cmd:
+        return
+
+    health_url = llm.option_str("vllm_health_url", "").strip()
+    if not health_url:
+        base = llm.default_base_url().strip()
+        if base:
+            health_url = base.rstrip("/") + "/v1/models"
+
+    wait_s = _parse_float(llm.option_str("vllm_wait_s", "30"), 30.0)
+
+    # If already healthy, skip.
+    if health_url and _health_ok(health_url, timeout_s=2.0):
+        return
+
+    log_path = llm.option_str("vllm_log_path", "").strip()
+    if not log_path:
+        log_path = "/tmp/mathagent_vllm.log"
+    try:
+        log_f = open(log_path, "ab")
+    except Exception:
+        log_f = None
+
+    start_with_bash = llm.option_bool("vllm_start_with_bash", False)
+    try:
+        if start_with_bash:
+            subprocess.Popen(
+                ["bash", "-lc", cmd],
+                stdout=log_f or subprocess.DEVNULL,
+                stderr=log_f or subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        else:
+            subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=log_f or subprocess.DEVNULL,
+                stderr=log_f or subprocess.DEVNULL,
+                start_new_session=True,
+            )
+    except Exception as e:
+        print(f"[WARN] vLLM autostart failed to spawn: {e}", file=sys.stderr, flush=True)
+        return
+
+    if health_url and wait_s > 0:
+        ok = _wait_for_health(health_url, wait_s)
+        if not ok:
+            print(f"[WARN] vLLM autostart did not become healthy within {wait_s:.1f}s: {health_url}", file=sys.stderr, flush=True)
 
 
 def _contains_conn_error_marker(obj: Any, *, max_nodes: int = 5000) -> bool:
@@ -2059,33 +2176,6 @@ def _run_one_input(
             if u is not None:
                 result_done.add(str(u))
 
-    # ---- Shared judge helper (Stage1/2/3) ----
-    def _as_choice_letter(s: str) -> str:
-        """If s looks like 'A' or 'A.xxx', return 'A'; else return original trimmed string."""
-        if not isinstance(s, str):
-            return ""
-        ss = s.strip()
-        if not ss:
-            return ""
-        c0 = ss[0].upper()
-        if c0 in ("A", "B", "C", "D"):
-            return c0
-        return ss
-
-    def _select_answer(*, gold: str, majority: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Select the final answer for this stage:
-        - If voting is confident (majority_count >= min_votes_to_accept): use voting result
-        - Else: fall back to provided gold answer
-        """
-        maj_raw = str((majority or {}).get("majority") or "").strip()
-        maj_cnt = int((majority or {}).get("majority_count") or 0)
-        gold_letter = _as_choice_letter(gold)
-        maj_letter = _as_choice_letter(maj_raw)
-        if maj_cnt >= int(min_votes_to_accept) and maj_letter:
-            return {"final_answer": maj_letter, "final_source": "majority", "final_vote_count": maj_cnt}
-        return {"final_answer": gold_letter or gold.strip(), "final_source": "answer_fallback", "final_vote_count": maj_cnt}
-
     def _to_result_entry(*, stage: str, final_answer: str, entry: Dict[str, Any]) -> Dict[str, Any]:
         """
         Canonical result schema (one line per uuid per input file):
@@ -2132,51 +2222,6 @@ def _run_one_input(
             "majority_answer": entry.get("majority_answer"),
             "attempts": attempts_slim,
         }
-
-    def _llm_judge_equivalence(
-        *,
-        uuid: Any,
-        question: str,
-        gold: str,
-        pred: str,
-        choice_map: Dict[str, str],
-        stage: str,
-        stats: Dict[str, int] | None = None,
-    ) -> bool | None:
-        """
-        Ask LLM to judge equivalence only when rules cannot decide.
-        Return True/False/None.
-        """
-        choice_lines = []
-        for k in ("A", "B", "C", "D"):
-            if k in choice_map:
-                choice_lines.append(f"{k} = {choice_map[k]}")
-        choice_block = "\n".join(choice_lines)
-        user = (
-            "你是“答案一致性判定器”，只判断 pred 是否与 gold 含义一致，禁止解题。\n"
-            "输出必须是且只能是三者之一：一致 / 不一致 / 不确定\n\n"
-            f"[题目]\n{question}\n\n"
-            f"[选项映射]\n{choice_block}\n\n"
-            f"[gold]\n{gold}\n\n"
-            f"[pred]\n{pred}\n"
-        ).strip()
-        resp = llm.generate_n(
-            stage_name=f"{stage}_judge",
-            question=user,
-            prompt_mode="raw_prompt",
-            sleep_s=sleep_s,
-            stats=stats,
-        )[0]
-        t = (resp or "").strip()
-        # Be strict: accept only the 3 allowed outputs (optionally with trivial punctuation).
-        first = (t.splitlines()[0] if t else "").strip().strip("。.!！?？")
-        if first == "不确定":
-            return None
-        if first == "不一致":
-            return False
-        if first == "一致":
-            return True
-        return None
 
     try:
         shutil.copyfile(input_path, raw_input_copy_path)
@@ -2246,6 +2291,7 @@ def _run_one_input(
             sel1 = _select_answer(
                 gold=gold,
                 majority={"majority": vote_majority, "majority_count": vote_majority_count, "counts": (maj.get("counts") if isinstance(maj, dict) else {})},
+                min_votes_to_accept=min_votes_to_accept,
             )
 
             row = {
@@ -2324,12 +2370,14 @@ def _run_one_input(
                 judge_src = "rules"
                 if eq is None:
                     eq = _llm_judge_equivalence(
+                        llm=llm,
                         uuid=uuid,
                         question=q_raw,
                         gold=gold,
                         pred=pred_final,
                         choice_map=choice_map,
                         stage="stage1",
+                        sleep_s=sleep_s,
                         stats=s1_judge_stats,
                     )
                     judge_src = "llm" if eq is not None else "unknown"
@@ -2417,7 +2465,7 @@ def _run_one_input(
 
             counts = extract_boxed_counts(eval_text)
             route_ok, route_bad = (counts if counts is not None else (ok1, n1 - ok1))
-            sel1 = _select_answer(gold=gold, majority=majority_answer_json)
+            sel1 = _select_answer(gold=gold, majority=majority_answer_json, min_votes_to_accept=min_votes_to_accept)
             # Routing uses vote strength (consensus). If not enough votes, go to Stage2.
             next_stage = (
                 "stage2" if int(majority_answer_json.get("majority_count", 0)) < int(min_votes_to_accept) else "accepted"
@@ -2535,12 +2583,14 @@ def _run_one_input(
         for raw, pred_i in zip(raw_solutions[:n2], extracted[:n2]):
             extracted_final = str(pred_i or "").strip()
             eq = _llm_judge_equivalence(
+                llm=llm,
                 uuid=uuid,
                 question=q_raw,
                 gold=gold,
                 pred=extracted_final,
                 choice_map=choice_map,
                 stage="stage2",
+                sleep_s=sleep_s,
                 stats=s2_judge_stats,
             )
             judge_src = "llm" if eq is not None else "unknown"
@@ -2569,7 +2619,7 @@ def _run_one_input(
             "counts": dict(s2_vote.counts),
         }
 
-        sel2 = _select_answer(gold=gold, majority=stage2_majority_answer)
+        sel2 = _select_answer(gold=gold, majority=stage2_majority_answer, min_votes_to_accept=min_votes_to_accept)
         final_answer2 = str(sel2.get("final_answer") or "").strip()
 
         entry: Dict[str, Any] = {
@@ -2629,7 +2679,7 @@ def _run_one_input(
                 "min_votes_to_accept": int(min_votes_to_accept),
                 "vote_majority": stage2_majority_answer.get("majority"),
                 "vote_majority_count": int(stage2_majority_answer.get("majority_count", 0)),
-                **_select_answer(gold=gold, majority=stage2_majority_answer),
+                **_select_answer(gold=gold, majority=stage2_majority_answer, min_votes_to_accept=min_votes_to_accept),
                 "next_stage": next_stage,
                 "difficulty": r.get("_difficulty"),
                 "stage1_ok": r.get("_stage1_ok"),
@@ -2692,12 +2742,14 @@ def _run_one_input(
         for raw, pred_i in zip(raw_solutions[:n3], extracted[:n3]):
             extracted_final = str(pred_i or "").strip()
             eq = _llm_judge_equivalence(
+                llm=llm,
                 uuid=uuid,
                 question=q_raw,
                 gold=gold,
                 pred=extracted_final,
                 choice_map=choice_map,
                 stage="stage3",
+                sleep_s=sleep_s,
                 stats=s3_judge_stats,
             )
             judge_src = "llm" if eq is not None else "unknown"
@@ -2726,7 +2778,7 @@ def _run_one_input(
             "counts": dict(s3_vote.counts),
         }
 
-        sel3 = _select_answer(gold=gold, majority=stage3_majority_answer)
+        sel3 = _select_answer(gold=gold, majority=stage3_majority_answer, min_votes_to_accept=min_votes_to_accept)
         final_answer3 = str(sel3.get("final_answer") or "").strip()
 
         entry = {
@@ -2882,6 +2934,8 @@ def main() -> None:
 
     llm = LLMRouter(config_path=args.llm_config)
     min_votes_to_accept = llm.threshold_int("min_votes_to_accept", 5)
+    _configure_vllm_recovery_envs(llm)
+    _maybe_autostart_vllm(llm)
 
     # ---- Route-A modular modes ----
     if mode != "full":

@@ -63,9 +63,11 @@
 - **eval（stage1_eval）**
   - **优先解析**：从 `stage1_output.stage1.jsonl` 的 `output` 里解析 `\\boxed{解答正确：x，解答错误：y}`（不需要 LLM）
   - **解析失败兜底**：才会用 stored `prompt + [GOLD_STANDARD_ANSWER]=...` 调 `stage1_eval`
-  - 路由（实现口径）：`ok >= min_votes_to_accept` 则 accepted，否则进入 Stage2（并写 `stage2_input.stage2.jsonl`）
+  - 路由（stage1_eval 模式）：`ok >= min_votes_to_accept` 则 accepted，否则进入 Stage2（并写 `stage2_input.stage2.jsonl`）
 
-> 注意：Stage1 的“是否进入 Stage2”是基于 **eval 统计的 ok**，不是基于 Stage2/3 的 `final_vote_count` 规则。
+> 注意：Stage1 的路由规则在不同执行模式有差异：
+> - **stage1_eval 模式**：使用 boxed counts 的 ok/bad 统计
+> - **full 模式**：使用 solve 投票的 `majority_count`（共识强度）决定是否进入 Stage2
 
 #### Stage2（infer + eval/归档/路由）
 
@@ -113,22 +115,11 @@ Stage3 结构与 Stage2 类似：
 
 可通过 `MATHAGENT_DISABLE_PURGE_CONN_ERRORS=1` 关闭。
 
-### 冗余逻辑与可简化点（基于当前实现）
+### 规格补充（当前实现的约束与约定）
 
-下面这些点会让逻辑重复、难维护，是潜在的重构收益点：
-
-- **`run_pipeline.py` 内的重复 helper**：
-  - 文件中既有全局 `_select_answer/_llm_judge_equivalence/_as_choice_letter`，又在 `_run_one_input()` 内重复定义了一套（行为基本一致）。
-  - 建议：保留一处实现（最好是全局/可测试函数），统一 full/modular 调用。
-- **Stage1 eval 的双入口兼容路径**：
-  - `stage1_eval` 既支持从 `stage1_output` 解析 boxed counts，也支持从 `stage1_infer` 回退生成 `stage1_output`（Backward-compat 分支）。
-  - 建议：如果不再需要旧工件格式，可删掉 infer-based 兼容分支，或把“工件升级”做成独立命令。
-- **Stage2 infer 的双入口**：
-  - 既支持读 `stage2_input`，也支持从 `stage1_output + status.stage1` 反推任务列表（兼容逻辑会扩大复杂度）。
-  - 建议：固定使用 `stage2_input` 作为唯一入口，让 `stage1_eval` 明确负责产出它。
-- **判别链路分散**：
-  - Stage2/3 eval 里既有规则判别，又有 LLM judge，且 attempts 的字段（boxed/extracted/normalized）在不同 stage 的含义略有差异。
-  - 建议：提取统一的 `Attempt` 结构与判别流水线（extract -> normalize -> rule -> llm_judge -> vote -> select）。
-
-
+- **抽取优先级**：`extract_boxed_answer` > `extract_final_answer`；抽取结果为空时不会参与投票
+- **规则判别优先**：`rule_equivalent` 返回 True/False 即直接判定，只有 `None` 才会调用 LLM judge
+- **多数投票口径**：投票基于“规范化后的答案字符串”，并过滤空答案以避免错误伪共识
+- **Stage2/3 final 规则**：`majority_count >= min_votes_to_accept` 则 `final_source="majority"`；否则 `final_source="answer_fallback"`（fallback = gold）
+- **Result 只收 majority**：`result/*.result.stage_final.jsonl` 仅收录 `final_source="majority"` 的样本
 

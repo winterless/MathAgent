@@ -197,6 +197,18 @@ class LLMRouter:
         except Exception:
             return int(default)
 
+    def default_base_url(self) -> str:
+        """
+        Return base_url of the default routed model if available (empty string otherwise).
+        """
+        model_key = self._routes.get("default")
+        if not model_key:
+            return ""
+        client = self._clients.get(model_key)
+        if client is None:
+            return ""
+        return str(client.config.base_url or "")
+
     def think_tag_for_stage(self, stage_name: str) -> str:
         """
         Returns a prefix tag to inject into user content for some models (e.g. Qwen /think or /no_think).
