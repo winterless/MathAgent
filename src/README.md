@@ -48,6 +48,25 @@ export MATHAGENT_LLM_CONNREFUSED_LOG=1
 PYTHONPATH=src python3 src/run_pipeline.py --input datasets/example_input.jsonl --out datasets/out/demo --llm-config config/llm_models.json
 ```
 
+## Startup cleanup: remove rows with connection errors so reruns can reprocess them
+
+If some produced artifacts contain connection-related LLM error markers (e.g. `[LLM_ERROR ... connection refused ...]`),
+re-running the pipeline may skip those uuids because they already appear in `stage*_infer` / `status.stage*` files.
+
+By default, `src/run_pipeline.py` performs a best-effort cleanup on startup:
+
+- It scans JSONL files under `--out` (derived artifacts like `stage*_infer`, `stage*_archive`, `status.stage*`, `accepted_bank`, `result`)
+- It collects uuids whose rows contain connection/network error markers
+- It removes those uuids from the derived artifacts (so the next run will include them again)
+
+It does **not** delete task lists (`stage2_input.stage2.jsonl`, `stage3_input.stage3.jsonl`), nor `stage1_output.stage1.jsonl`, nor `stage0` copies.
+
+To disable this behavior:
+
+```bash
+export MATHAGENT_DISABLE_PURGE_CONN_ERRORS=1
+```
+
 Outputs (all JSONL) are written under `--out`.
 
 Per input file, artifacts are always **prefixed by the input filename stem**:

@@ -34,6 +34,180 @@ from dataio.jsonl_io import append_jsonl_line, iter_jsonl, write_jsonl_atomic
 from dataio.sample_schema import CANONICAL_KEYS, normalize_output_wrapper, normalize_record
 
 
+_CONN_ERROR_MARKERS = (
+    # Typical urllib/vLLM/OpenAI-compatible error text
+    "connection refused",
+    "errno 111",
+    "llm network error",
+    "urlopen error",
+    "connection reset",
+    "broken pipe",
+    "timed out",
+    "timeout",
+    "temporary failure in name resolution",
+)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return bool(default)
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on", "enable", "enabled"):
+        return True
+    if s in ("0", "false", "no", "n", "off", "disable", "disabled"):
+        return False
+    return bool(default)
+
+
+def _contains_conn_error_marker(obj: Any, *, max_nodes: int = 5000) -> bool:
+    """
+    Best-effort: recursively search for connection/network error markers inside an object.
+    We keep it conservative: only trigger when we find explicit markers or our "[LLM_ERROR...]" wrapper.
+    """
+    n = 0
+    stack: List[Any] = [obj]
+    while stack:
+        cur = stack.pop()
+        n += 1
+        if n > int(max_nodes):
+            return False
+        if cur is None:
+            continue
+        if isinstance(cur, str):
+            s = cur.strip()
+            if not s:
+                continue
+            s_low = s.lower()
+            if s_low.startswith("[llm_error"):
+                # Only treat as "connection" issue if the message indicates connectivity.
+                return any(m in s_low for m in _CONN_ERROR_MARKERS)
+            if any(m in s_low for m in _CONN_ERROR_MARKERS):
+                return True
+            continue
+        if isinstance(cur, dict):
+            for v in cur.values():
+                stack.append(v)
+            continue
+        if isinstance(cur, (list, tuple)):
+            for v in cur:
+                stack.append(v)
+            continue
+    return False
+
+
+def _iter_out_jsonl_files(out_dir: str) -> List[str]:
+    paths: List[str] = []
+    for root, _, files in os.walk(out_dir):
+        for name in files:
+            if name.endswith(".jsonl"):
+                paths.append(os.path.join(root, name))
+    paths.sort()
+    return paths
+
+
+def _should_purge_from_file(path: str) -> bool:
+    """
+    Purge only from derived artifacts that act as "done markers" or archived results.
+    Do NOT purge from:
+      - stage0 copies (inputs)
+      - stage2_input / stage3_input (task lists)
+      - stage1_output (upstream input for modular routes)
+    """
+    base = os.path.basename(path)
+    if base == "stage0.jsonl" or base.endswith(".stage0.jsonl"):
+        return False
+    if base.endswith("stage2_input.stage2.jsonl") or base.endswith("stage3_input.stage3.jsonl"):
+        return False
+    if base.endswith("stage1_output.stage1.jsonl"):
+        return False
+    return True
+
+
+def _scan_bad_uuids_for_conn_errors(out_dir: str) -> set:
+    """
+    Scan existing produced artifacts under out_dir and collect uuids that contain connection-related LLM errors.
+    Returns a set of str(uuid).
+    """
+    bad: set = set()
+    for pth in _iter_out_jsonl_files(out_dir):
+        if not _should_purge_from_file(pth):
+            continue
+        try:
+            with open(pth, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = (line or "").strip()
+                    if not s:
+                        continue
+                    try:
+                        row = json.loads(s)
+                    except Exception:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    u = row.get("uuid")
+                    if u is None:
+                        continue
+                    if _contains_conn_error_marker(row):
+                        bad.add(str(u))
+        except Exception:
+            # best-effort
+            continue
+    return bad
+
+
+def _purge_uuids_from_out_dir(out_dir: str, uuids: set) -> Dict[str, int]:
+    """
+    Purge lines whose uuid is in `uuids` from selected output artifacts under out_dir.
+    Returns per-file removed line counts.
+    """
+    removed: Dict[str, int] = {}
+    if not uuids:
+        return removed
+    for pth in _iter_out_jsonl_files(out_dir):
+        if not _should_purge_from_file(pth):
+            continue
+        tmp = f"{pth}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
+        n_removed = 0
+        changed = False
+        try:
+            with open(pth, "r", encoding="utf-8") as fin, open(tmp, "w", encoding="utf-8") as fout:
+                for line in fin:
+                    s = (line or "").strip()
+                    if not s:
+                        fout.write(line)
+                        continue
+                    keep = True
+                    try:
+                        row = json.loads(s)
+                    except Exception:
+                        row = None
+                    if isinstance(row, dict):
+                        u = row.get("uuid")
+                        if u is not None and str(u) in uuids:
+                            keep = False
+                    if keep:
+                        fout.write(line)
+                    else:
+                        n_removed += 1
+                        changed = True
+            if changed:
+                os.replace(tmp, pth)
+                removed[pth] = int(n_removed)
+            else:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            continue
+    return removed
+
+
 def _default_out_dir() -> str:
     ts = time.strftime("%Y%m%d-%H%M%S")
     return os.path.join("datasets", "out", ts)
@@ -2690,6 +2864,21 @@ def main() -> None:
     os.makedirs(stage1_dir, exist_ok=True)
     os.makedirs(stage2_dir, exist_ok=True)
     os.makedirs(stage3_dir, exist_ok=True)
+
+    # ---- Startup cleanup: purge connection-error rows so reruns can reprocess those uuids ----
+    # Default: enabled. Disable by setting MATHAGENT_DISABLE_PURGE_CONN_ERRORS=1.
+    if not _env_bool("MATHAGENT_DISABLE_PURGE_CONN_ERRORS", False):
+        bad = _scan_bad_uuids_for_conn_errors(str(args.out))
+        if bad:
+            removed = _purge_uuids_from_out_dir(str(args.out), bad)
+            # Log a compact summary to stderr (so stdout stays clean for pipelines).
+            total_removed = sum(int(v) for v in removed.values())
+            print(
+                f"[CLEAN] Purged {len(bad)} uuid(s) with connection errors from {len(removed)} file(s); "
+                f"removed_lines={total_removed}. Set MATHAGENT_DISABLE_PURGE_CONN_ERRORS=1 to disable.",
+                file=sys.stderr,
+                flush=True,
+            )
 
     llm = LLMRouter(config_path=args.llm_config)
     min_votes_to_accept = llm.threshold_int("min_votes_to_accept", 5)
