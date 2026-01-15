@@ -199,12 +199,25 @@ class LLMRouter:
         except Exception:
             return int(default)
 
+    def override_options(self, updates: Dict[str, Any]) -> None:
+        """
+        Override options at runtime (e.g., CLI overrides).
+        Re-applies recovery config after updates.
+        """
+        if not updates:
+            return
+        for k, v in updates.items():
+            if v is None:
+                continue
+            self._options[k] = v
+        self._apply_recovery_config()
+
     def _apply_recovery_config(self) -> None:
         """
         Build recovery settings from options and apply to all clients.
         This avoids env var dependency.
         """
-        start_cmd = str(self._options.get("vllm_start_cmd") or "").strip()
+        start_cmd = self.vllm_start_cmd_resolved()
         stop_cmd = str(self._options.get("vllm_stop_cmd") or "").strip()
         restart_cmd = str(self._options.get("vllm_restart_cmd") or "").strip()
         if not restart_cmd:
@@ -214,7 +227,7 @@ class LLMRouter:
                 restart_cmd = start_cmd
 
         wait_s = self.option_int("vllm_wait_s", 0)
-        health_url = str(self._options.get("vllm_health_url") or "").strip()
+        health_url = self.vllm_health_url_resolved()
 
         cfg = RecoveryConfig(
             wait_on_connrefused_s=float(wait_s),
@@ -227,6 +240,43 @@ class LLMRouter:
         )
         for c in self._clients.values():
             c.set_recovery_config(cfg)
+
+    def _render_vllm_cmd(self, cmd: str, model_path: str, model_name: str) -> str:
+        """
+        If placeholders exist, replace them. Otherwise, append model args when provided.
+        Supported placeholders:
+          - {model_path}
+          - {model_name}
+        """
+        out = str(cmd or "").strip()
+        if not out:
+            return ""
+        has_path = "{model_path}" in out
+        has_name = "{model_name}" in out
+        if has_path or has_name:
+            return out.replace("{model_path}", model_path).replace("{model_name}", model_name)
+        # No placeholders: append model args if provided.
+        parts = [out]
+        if model_path:
+            parts.append(f'--model "{model_path}"')
+        if model_name:
+            parts.append(f"--served-model-name {model_name}")
+        return " ".join(parts)
+
+    def vllm_start_cmd_resolved(self) -> str:
+        cmd = str(self._options.get("vllm_start_cmd") or "").strip()
+        model_path = str(self._options.get("vllm_model_path") or "").strip()
+        model_name = str(self._options.get("vllm_model_name") or "").strip()
+        return self._render_vllm_cmd(cmd, model_path, model_name)
+
+    def vllm_health_url_resolved(self) -> str:
+        health_url = str(self._options.get("vllm_health_url") or "").strip()
+        if health_url:
+            return health_url
+        base = self.default_base_url().strip()
+        if base:
+            return base.rstrip("/") + "/v1/models"
+        return ""
 
     def default_base_url(self) -> str:
         """

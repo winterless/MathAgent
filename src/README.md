@@ -46,7 +46,9 @@ Example:
 {
   "options": {
     "vllm_autostart": true,
-    "vllm_start_cmd": "python -m vllm.entrypoints.openai.api_server --model \"/path/to/model\" --served-model-name Qwen3-8B --dtype auto --tensor-parallel-size 1 --max-model-len 32384 --gpu-memory-utilization 0.85 --swap-space 8 --port 8000",
+    "vllm_model_path": "/path/to/model",
+    "vllm_model_name": "Qwen3-8B",
+    "vllm_start_cmd": "python -m vllm.entrypoints.openai.api_server --model \"{model_path}\" --served-model-name {model_name} --dtype auto --tensor-parallel-size 1 --max-model-len 32384 --gpu-memory-utilization 0.85 --swap-space 8 --port 8000",
     "vllm_wait_s": 60,
     "vllm_health_url": "http://127.0.0.1:8000/v1/models",
     "vllm_restart_on_connrefused": true,
@@ -67,6 +69,7 @@ Notes:
 - If `vllm_restart_cmd` is empty, the pipeline automatically combines `vllm_stop_cmd; vllm_start_cmd`.
 - `vllm_shutdown_on_exit=true` stops vLLM when the pipeline exits (uses `vllm_stop_cmd`).
 - `vllm_stop_cmd` should be a safe stop command for your environment (e.g. `pkill -f vllm.entrypoints.openai.api_server`).
+ - `vllm_model_path` / `vllm_model_name` are injected into `vllm_start_cmd` via `{model_path}` and `{model_name}` placeholders.
 
 ## Startup cleanup: remove rows with connection errors so reruns can reprocess them
 

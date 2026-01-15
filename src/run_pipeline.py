@@ -102,15 +102,11 @@ def _maybe_autostart_vllm(llm: LLMRouter) -> bool:
     if not llm.option_bool("vllm_autostart", False):
         return False
 
-    cmd = llm.option_str("vllm_start_cmd", "").strip()
+    cmd = llm.vllm_start_cmd_resolved()
     if not cmd:
         return False
 
-    health_url = llm.option_str("vllm_health_url", "").strip()
-    if not health_url:
-        base = llm.default_base_url().strip()
-        if base:
-            health_url = base.rstrip("/") + "/v1/models"
+    health_url = llm.vllm_health_url_resolved()
 
     wait_s = _parse_float(llm.option_str("vllm_wait_s", "30"), 30.0)
 
@@ -2881,6 +2877,8 @@ def main() -> None:
         default="config/llm_models.json",
         help="Path to JSON config describing models + stage routing.",
     )
+    p.add_argument("--vllm-model", default=None, help="Override vLLM model path for autostart/restart.")
+    p.add_argument("--vllm-served-model-name", default=None, help="Override vLLM served model name.")
     args = p.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -2906,6 +2904,15 @@ def main() -> None:
     os.makedirs(stage2_dir, exist_ok=True)
     os.makedirs(stage3_dir, exist_ok=True)
 
+    llm = LLMRouter(config_path=args.llm_config)
+    llm.override_options(
+        {
+            "vllm_model_path": args.vllm_model,
+            "vllm_model_name": args.vllm_served_model_name,
+        }
+    )
+    min_votes_to_accept = llm.threshold_int("min_votes_to_accept", 5)
+
     # ---- Startup cleanup: purge connection-error rows so reruns can reprocess those uuids ----
     # Default: enabled; toggle via config option `purge_conn_errors_on_start`.
     if llm.option_bool("purge_conn_errors_on_start", True):
@@ -2920,9 +2927,6 @@ def main() -> None:
                 file=sys.stderr,
                 flush=True,
             )
-
-    llm = LLMRouter(config_path=args.llm_config)
-    min_votes_to_accept = llm.threshold_int("min_votes_to_accept", 5)
     started_by_us = _maybe_autostart_vllm(llm)
     if llm.option_bool("vllm_shutdown_on_exit", False):
         # Always honor shutdown_on_exit; if you only want to stop when we started it, set vllm_stop_cmd accordingly.

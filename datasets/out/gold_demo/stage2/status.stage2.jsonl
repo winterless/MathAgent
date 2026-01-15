@@ -1,1 +1,0 @@
-{"uuid": "ex-1", "stage": "stage2", "ok": 0, "bad": 4, "min_votes_to_accept": 3, "vote_majority": "A.966", "vote_majority_count": 2, "final_answer": "B", "final_source": "answer_fallback", "final_vote_count": 2, "next_stage": "stage3", "difficulty": 3, "stage1_ok": 1, "stage1_bad": 3, "paths": {"archive": "datasets/out/demo21/stage2/stage2_archive.stage2.jsonl"}}
