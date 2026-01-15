@@ -85,6 +85,18 @@ class LLMClient:
     def set_recovery_config(self, cfg: RecoveryConfig) -> None:
         self.recovery = cfg
 
+    def _spawn_restart(self, cmd: str, *, log: bool = False) -> None:
+        if not cmd:
+            return
+        if log:
+            print(f"[LLM] running restart cmd: {cmd}", file=sys.stderr, flush=True)
+        try:
+            subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            if log:
+                print(f"[LLM] restart cmd failed to spawn: {e}", file=sys.stderr, flush=True)
+            return
+
     def _has_py_script(self) -> bool:
         return bool((self.config.py_script or "").strip())
 
@@ -486,7 +498,7 @@ class LLMClient:
                 if now - _LAST_RESTART_TS < cooldown_s:
                     return
                 _LAST_RESTART_TS = now
-            _spawn_restart(cmd, log=False)
+            self._spawn_restart(cmd, log=False)
 
         mode = (prompt_mode or "problem").strip().lower()
         if mode in ("raw_prompt", "raw_prompt_eval"):
