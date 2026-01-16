@@ -116,6 +116,7 @@ Rebuild rules:
 - Only include rows with `majority_count >= min_votes_to_accept`
 - Only include rows where one attempt matches the majority answer
 - Result schema: `{"uuid": ..., "text": "<raw_text>"}` (raw_text from the matching attempt)
+- Summary file: `result/summary.result_rebuild.json` (counts, estimated tokens, stage breakdown)
 
 ### Stage1: infer -> eval
 

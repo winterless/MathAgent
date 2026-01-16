@@ -882,6 +882,20 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int) -> None:
 
     # Cache existing result uuids per prefix
     existing: Dict[str, set[str]] = {}
+    stats = {
+        "total_rows_scanned": 0,
+        "total_candidates": 0,
+        "total_written": 0,
+        "estimated_tokens": 0,
+        "by_stage": {"stage2": 0, "stage3": 0, "unknown": 0},
+        "by_source": {"accepted_bank": 0, "stage2_archive": 0, "stage3_archive": 0},
+        "files_scanned": list(all_paths),
+    }
+
+    def _estimate_tokens(text: str) -> int:
+        # Conservative heuristic: ~4 chars per token for mixed CJK/ASCII.
+        s = str(text or "")
+        return max(1, int(len(s) / 4)) if s else 0
 
     def _get_done(prefix: str) -> set[str]:
         if prefix in existing:
@@ -927,12 +941,15 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int) -> None:
         if base.endswith("accepted_bank.stage_final.jsonl"):
             prefix = _infer_prefix_from_artifact(pth, suffix="accepted_bank.stage_final.jsonl")
             stage = None
+            source = "accepted_bank"
         elif base.endswith("stage2_archive.stage2.jsonl"):
             prefix = _infer_prefix_from_artifact(pth, suffix="stage2_archive.stage2.jsonl")
             stage = "stage2"
+            source = "stage2_archive"
         elif base.endswith("stage3_archive.stage3.jsonl"):
             prefix = _infer_prefix_from_artifact(pth, suffix="stage3_archive.stage3.jsonl")
             stage = "stage3"
+            source = "stage3_archive"
         else:
             continue
 
@@ -940,6 +957,7 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int) -> None:
         done = _get_done(prefix)
 
         for row in iter_jsonl(pth, tolerate_errors=True):
+            stats["total_rows_scanned"] += 1
             if not isinstance(row, dict):
                 continue
             u = row.get("uuid")
@@ -951,8 +969,29 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int) -> None:
             raw_text = _extract_text_if_majority(row)
             if raw_text is None:
                 continue
+            stats["total_candidates"] += 1
             append_jsonl_line(result_path, {"uuid": u, "text": raw_text})
             done.add(u_str)
+            stats["total_written"] += 1
+            stats["estimated_tokens"] += _estimate_tokens(raw_text)
+            stats["by_source"][source] = int(stats["by_source"].get(source, 0)) + 1
+            if stage is None:
+                accepted_from = str(row.get("accepted_from") or "")
+                if accepted_from in ("stage2", "stage3"):
+                    stats["by_stage"][accepted_from] += 1
+                else:
+                    stats["by_stage"]["unknown"] += 1
+            else:
+                stats["by_stage"][stage] += 1
+
+    # Write summary file under result/
+    summary_path = os.path.join(out_dir, "result", "summary.result_rebuild.json")
+    try:
+        os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(stats, ensure_ascii=False, indent=2) + "\n")
+    except Exception:
+        pass
 
 
 def mode_stage1_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_to_accept: int, sleep_s: float) -> List[str]:
