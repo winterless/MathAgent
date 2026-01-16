@@ -11,6 +11,7 @@ import urllib.request
 import concurrent.futures
 import threading
 from dataclasses import dataclass
+import shlex
 from typing import Any, Callable, Dict, List, Optional
 
 
@@ -27,6 +28,8 @@ class RecoveryConfig:
     restart_on_connrefused: bool = False
     restart_on_runtime_error: bool = False
     restart_cooldown_s: float = 30.0
+    start_cmd: str = ""
+    restart_fallback_to_start: bool = True
     log_path: str = ""
     log_to_stderr: bool = True
 
@@ -93,37 +96,50 @@ class LLMClient:
             return
         if log:
             print(f"[LLM] running restart cmd: {cmd}", file=sys.stderr, flush=True)
-        try:
-            log_path = (self.recovery.log_path or "").strip()
-            use_tee = bool(self.recovery.log_to_stderr) and bool(log_path)
-            if use_tee and "tee -a" not in cmd:
-                log_q = shlex.quote(log_path)
-                wrapped = f"set -x; set -o pipefail; {cmd} 2>&1 | tee -a {log_q} >&2"
-            else:
-                wrapped = f"set -x; {cmd}"
-            if log:
-                proc = subprocess.Popen(
-                    ["bash", "-lc", wrapped],
-                    stdout=None,
-                    stderr=None,
-                    start_new_session=True,
-                )
-                print(f"[LLM] restart cmd pid={proc.pid}", file=sys.stderr, flush=True)
-                time.sleep(0.2)
-                rc = proc.poll()
-                if rc is not None:
-                    print(f"[LLM] restart cmd exited rc={rc}", file=sys.stderr, flush=True)
-            else:
+        def _spawn_one(cmd_in: str, *, label: str) -> int | None:
+            try:
+                log_path = (self.recovery.log_path or "").strip()
+                use_tee = bool(self.recovery.log_to_stderr) and bool(log_path)
+                if use_tee and "tee -a" not in cmd_in:
+                    log_q = shlex.quote(log_path)
+                    wrapped = f"set -x; set -o pipefail; {cmd_in} 2>&1 | tee -a {log_q} >&2"
+                else:
+                    wrapped = f"set -x; {cmd_in}"
+                if log:
+                    proc = subprocess.Popen(
+                        ["bash", "-lc", wrapped],
+                        stdout=None,
+                        stderr=None,
+                        start_new_session=True,
+                    )
+                    print(f"[LLM] {label} pid={proc.pid}", file=sys.stderr, flush=True)
+                    time.sleep(0.2)
+                    rc = proc.poll()
+                    if rc is not None:
+                        print(f"[LLM] {label} exited rc={rc}", file=sys.stderr, flush=True)
+                    return rc
                 subprocess.Popen(
                     ["bash", "-lc", wrapped],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
                 )
-        except Exception as e:
-            if log:
-                print(f"[LLM] restart cmd failed to spawn: {e}", file=sys.stderr, flush=True)
-            return
+                return None
+            except Exception as e:
+                if log:
+                    print(f"[LLM] {label} failed to spawn: {e}", file=sys.stderr, flush=True)
+                return None
+
+        rc = _spawn_one(cmd, label="restart cmd")
+        if (
+            rc is not None
+            and rc != 0
+            and self.recovery.restart_fallback_to_start
+            and (self.recovery.start_cmd or "").strip()
+        ):
+            start_cmd = str(self.recovery.start_cmd or "").strip()
+            print(f"[LLM] restart cmd rc={rc}; fallback to start cmd", file=sys.stderr, flush=True)
+            _spawn_one(start_cmd, label="start cmd")
 
     def _has_py_script(self) -> bool:
         return bool((self.config.py_script or "").strip())
@@ -306,41 +322,7 @@ class LLMClient:
             stats[key] = int(stats.get(key, 0)) + inc
 
         def _spawn_restart(cmd: str, *, log: bool = False) -> None:
-            if not cmd:
-                return
-            if log:
-                print(f"[LLM] running restart cmd: {cmd}", file=sys.stderr, flush=True)
-            try:
-                log_path = (self.recovery.log_path or "").strip()
-                use_tee = bool(self.recovery.log_to_stderr) and bool(log_path)
-                if use_tee and "tee -a" not in cmd:
-                    log_q = shlex.quote(log_path)
-                    wrapped = f"set -x; set -o pipefail; {cmd} 2>&1 | tee -a {log_q} >&2"
-                else:
-                    wrapped = f"set -x; {cmd}"
-                if log:
-                    proc = subprocess.Popen(
-                        ["bash", "-lc", wrapped],
-                        stdout=None,
-                        stderr=None,
-                        start_new_session=True,
-                    )
-                    print(f"[LLM] restart cmd pid={proc.pid}", file=sys.stderr, flush=True)
-                    time.sleep(0.2)
-                    rc = proc.poll()
-                    if rc is not None:
-                        print(f"[LLM] restart cmd exited rc={rc}", file=sys.stderr, flush=True)
-                else:
-                    subprocess.Popen(
-                        ["bash", "-lc", wrapped],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        start_new_session=True,
-                    )
-            except Exception as e:
-                if log:
-                    print(f"[LLM] restart cmd failed to spawn: {e}", file=sys.stderr, flush=True)
-                return
+            self._spawn_restart(cmd, log=log)
 
         def _wait_for_health(*, wait_s: float, restart_cmd: str, restart_attempted: bool) -> bool:
             wait_s = float(wait_s or 0.0)

@@ -1015,13 +1015,13 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int) -> None:
             for attempt_idx, raw_text in matches:
                 attempt_uuid = f"{u_str}-{attempt_idx + 1}"
                 if attempt_uuid in done:
-                    continue
-                stats["total_candidates"] += 1
+                continue
+            stats["total_candidates"] += 1
                 append_jsonl_line(result_path, {"uuid": attempt_uuid, "text": raw_text})
                 done.add(attempt_uuid)
-                stats["total_written"] += 1
-                stats["estimated_tokens"] += _estimate_tokens(raw_text)
-                stats["by_source"][source] = int(stats["by_source"].get(source, 0)) + 1
+            stats["total_written"] += 1
+            stats["estimated_tokens"] += _estimate_tokens(raw_text)
+            stats["by_source"][source] = int(stats["by_source"].get(source, 0)) + 1
                 stats["by_stage"][stage] += 1
 
         print(

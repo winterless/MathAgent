@@ -239,6 +239,8 @@ class LLMRouter:
             restart_on_connrefused=self.option_bool("vllm_restart_on_connrefused", False),
             restart_on_runtime_error=self.option_bool("vllm_restart_on_runtime_error", False),
             restart_cooldown_s=float(self.option_int("vllm_restart_cooldown_s", 30)),
+            start_cmd=start_cmd,
+            restart_fallback_to_start=self.option_bool("vllm_restart_fallback_to_start", True),
             log_path=log_path,
             log_to_stderr=log_to_stderr,
         )
