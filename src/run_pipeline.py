@@ -936,18 +936,36 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int) -> None:
                     return raw
         return None
 
+    def _rebuild_prefix_for_path(path: str, *, suffix: str) -> str:
+        """
+        Derive result prefix. If artifacts are under a subdirectory of out_dir,
+        prepend that subdirectory name to avoid collisions across multi-run outputs.
+        """
+        prefix = _infer_prefix_from_artifact(path, suffix=suffix)
+        try:
+            rel = os.path.relpath(os.path.dirname(path), out_dir)
+            parts = [p for p in rel.split(os.sep) if p and p != "."]
+        except Exception:
+            parts = []
+        # If artifact is under a child run dir (not directly under stage*/result),
+        # prepend that child dir name to keep outputs unique in the parent result/.
+        if parts and parts[0] not in ("stage1", "stage2", "stage3", "result"):
+            run_name = parts[0]
+            return f"{run_name}.{prefix}" if prefix else run_name
+        return prefix
+
     for pth in all_paths:
         base = os.path.basename(pth)
         if base.endswith("accepted_bank.stage_final.jsonl"):
-            prefix = _infer_prefix_from_artifact(pth, suffix="accepted_bank.stage_final.jsonl")
+            prefix = _rebuild_prefix_for_path(pth, suffix="accepted_bank.stage_final.jsonl")
             stage = None
             source = "accepted_bank"
         elif base.endswith("stage2_archive.stage2.jsonl"):
-            prefix = _infer_prefix_from_artifact(pth, suffix="stage2_archive.stage2.jsonl")
+            prefix = _rebuild_prefix_for_path(pth, suffix="stage2_archive.stage2.jsonl")
             stage = "stage2"
             source = "stage2_archive"
         elif base.endswith("stage3_archive.stage3.jsonl"):
-            prefix = _infer_prefix_from_artifact(pth, suffix="stage3_archive.stage3.jsonl")
+            prefix = _rebuild_prefix_for_path(pth, suffix="stage3_archive.stage3.jsonl")
             stage = "stage3"
             source = "stage3_archive"
         else:

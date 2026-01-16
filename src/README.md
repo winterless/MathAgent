@@ -116,6 +116,9 @@ Rebuild rules:
 - Only include rows with `majority_count >= min_votes_to_accept`
 - Only include rows where one attempt matches the majority answer
 - Result schema: `{"uuid": ..., "text": "<raw_text>"}` (raw_text from the matching attempt)
+- If `--input` is a parent directory that contains multiple run subdirectories
+  (each with their own `stage1/2/3`), the subdirectory name is prepended to the
+  result prefix to avoid collisions. All results are written under the parent `result/`.
 - Summary file: `result/summary.result_rebuild.json` (counts, estimated tokens, stage breakdown)
 
 ### Stage1: infer -> eval
