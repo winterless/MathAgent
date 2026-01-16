@@ -17,7 +17,7 @@ import subprocess
 import urllib.request
 import urllib.error
 import atexit
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from core.prompt_assemble import assemble_stored_prompt
 from core.stages import (
@@ -910,62 +910,35 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int) -> None:
         existing[prefix] = done
         return done
 
-    def _extract_text_if_majority(row: Dict[str, Any]) -> str | None:
-        maj = row.get("majority_answer") if isinstance(row.get("majority_answer"), dict) else {}
-        maj_ans = str((maj or {}).get("majority") or "").strip()
-        try:
-            maj_cnt = int((maj or {}).get("majority_count") or 0)
-        except Exception:
-            maj_cnt = 0
-        if not maj_ans or maj_cnt < int(min_votes_to_accept):
-            return None
-        attempts = row.get("attempts") if isinstance(row.get("attempts"), list) else []
-        for a in attempts:
-            if not isinstance(a, dict):
-                continue
-            raw = a.get("raw_text")
-            if not isinstance(raw, str) or not raw.strip():
-                continue
-            cand_list = [
-                a.get("normalized_answer"),
-                a.get("extracted_answer"),
-                a.get("boxed_answer"),
-            ]
-            for cand in cand_list:
-                if not isinstance(cand, str):
-                    continue
-                c = cand.strip()
-                if not c:
-                    continue
-                if _as_choice_letter(c) == _as_choice_letter(maj_ans) or c == maj_ans:
-                    return raw
-        return None
+    def _match_answer(pred: str, gold: str) -> bool:
+        p = str(pred or "").strip()
+        g = str(gold or "").strip()
+        if not p or not g:
+            return False
+        return _as_choice_letter(p) == _as_choice_letter(g) or p == g
 
-    def _extract_text_if_majority_from_infer(row: Dict[str, Any]) -> str | None:
+    def _build_result_text(question: str, raw: str, pred: str) -> str:
+        q = str(question or "").strip()
+        r = str(raw or "").strip()
+        p = str(pred or "").strip()
+        return f"问题：{q}\n\n思考：{r}\n\n答案：{p}"
+
+    def _iter_correct_infer_attempts(row: Dict[str, Any]) -> List[Tuple[int, str]]:
         raws = row.get("raw_model_outputs") if isinstance(row.get("raw_model_outputs"), list) else []
         extracted = row.get("extracted_answers") if isinstance(row.get("extracted_answers"), list) else []
         if not raws or not extracted:
-            return None
-        # Normalize extracted answers and vote
-        cleaned = [str(x or "").strip() for x in extracted]
-        cleaned = [x for x in cleaned if x]
-        v = majority_vote(cleaned)
-        maj_ans = str(v.majority or "").strip()
-        maj_cnt = int(v.majority_count or 0)
-        if not maj_ans or maj_cnt < int(min_votes_to_accept):
-            return None
-        # Find a raw output whose extracted answer matches the majority
-        for raw, pred in zip(raws, extracted):
-            if not isinstance(raw, str):
-                raw = str(raw)
-            if not isinstance(pred, str):
-                pred = str(pred)
-            p = pred.strip()
-            if not p:
+            return []
+        gold = row.get("answer") or row.get("gold")
+        question = row.get("question")
+        if gold is None or question is None:
+            return []
+        results: List[Tuple[int, str]] = []
+        for idx, (raw, pred) in enumerate(zip(raws, extracted)):
+            if not _match_answer(pred, gold):
                 continue
-            if _as_choice_letter(p) == _as_choice_letter(maj_ans) or p == maj_ans:
-                return raw.strip()
-        return None
+            text = _build_result_text(question, raw, pred)
+            results.append((idx, text))
+        return results
 
     def _rebuild_prefix_for_path(path: str, *, suffix: str) -> str:
         """
@@ -1016,16 +989,20 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int) -> None:
             u_str = str(u)
             if u_str in done:
                 continue
-            raw_text = _extract_text_if_majority_from_infer(row)
-            if raw_text is None:
+            matches = _iter_correct_infer_attempts(row)
+            if not matches:
                 continue
-            stats["total_candidates"] += 1
-            append_jsonl_line(result_path, {"uuid": u, "text": raw_text})
-            done.add(u_str)
-            stats["total_written"] += 1
-            stats["estimated_tokens"] += _estimate_tokens(raw_text)
-            stats["by_source"][source] = int(stats["by_source"].get(source, 0)) + 1
-            stats["by_stage"][stage] += 1
+            for attempt_idx, raw_text in matches:
+                attempt_uuid = f"{u_str}-{attempt_idx + 1}"
+                if attempt_uuid in done:
+                    continue
+                stats["total_candidates"] += 1
+                append_jsonl_line(result_path, {"uuid": attempt_uuid, "text": raw_text})
+                done.add(attempt_uuid)
+                stats["total_written"] += 1
+                stats["estimated_tokens"] += _estimate_tokens(raw_text)
+                stats["by_source"][source] = int(stats["by_source"].get(source, 0)) + 1
+                stats["by_stage"][stage] += 1
 
         print(
             f"[result_rebuild] {idx}/{total_files} files "

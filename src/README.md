@@ -113,9 +113,9 @@ PYTHONPATH=src python3 src/run_pipeline.py \
 ```
 
 Rebuild rules:
-- Only include rows with `majority_count >= min_votes_to_accept`
-- Majority vote is computed from `extracted_answers`, and the matching `raw_model_outputs` is used as `text`
-- Result schema: `{"uuid": ..., "text": "<raw_text>"}`
+- For each infer row, emit one result per correct attempt (extracted answer matches gold).
+- Result schema: `{"uuid": ..., "text": "<question + reasoning + answer>"}`
+- To avoid collisions, each attempt appends its index to the uuid: `<uuid>-<attempt_idx>`
 - If `--input` is a parent directory that contains multiple run subdirectories
   (each with their own `stage1/2/3`), the subdirectory name is prepended to the
   result prefix to avoid collisions. All results are written under the parent `result/`.
