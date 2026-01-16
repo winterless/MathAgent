@@ -756,68 +756,46 @@ def _llm_extract_answers_batch(
     stats: Dict[str, int] | None = None,
 ) -> List[str]:
     """
-    Use LLM to extract canonical final answers from a batch of raw solver outputs.
+    Use LLM to extract canonical final answers from raw solver outputs.
+    Extracts one-by-one (not batched) for higher reliability.
     Returns a list of strings aligned with raw_outputs.
     """
     raws = [str(x) for x in (raw_outputs or [])]
     if not raws:
         return []
 
-    # If upstream produced explicit error markers, do not accidentally extract numeric codes (e.g. 503).
-    # Keep the "extract" step LLM-based, but we can safely short-circuit obvious error markers to "".
-    short: List[str] = []
-    todo: List[tuple[int, str]] = []
-    for i, t in enumerate(raws):
-        if (t or "").strip().startswith("[LLM_ERROR"):
-            short.append("")
-        else:
-            short.append("__TO_FILL__")
-            todo.append((i, t))
-    if not todo:
-        return short
-
-    choice_lines = []
-    for k in ("A", "B", "C", "D"):
-        if k in choice_map:
-            choice_lines.append(f"{k} = {choice_map[k]}")
-    choice_block = "\n".join(choice_lines)
-
-    attempts_block = "\n\n".join([f"[输出{i+1}]\n{t}" for i, t in enumerate(raws)])
-    user = (
-        "你是“最终答案抽取器”，只负责从模型输出中抽取最终答案，禁止解题。\n"
-        "请对下面 N 条输出逐条抽取最终答案，并按顺序返回 JSON 数组（长度必须等于 N）。\n"
-        "要求：\n"
-        "- 每个元素是字符串。\n"
-        "- 若是选择题，必须只输出 A/B/C/D（大写），不要输出选项内容。\n"
-        "- 若无法确定或输出里没有明确最终答案，输出空字符串 \"\"。\n"
-        "- 只输出 JSON 数组，不要输出任何额外文字。\n\n"
-        f"[题目]\n{question}\n\n"
-        f"[选项映射]\n{choice_block}\n\n"
-        f"[N]={len(raws)}\n\n"
-        f"{attempts_block}\n"
-    ).strip()
-
-    resp = llm.generate_n(
-        stage_name=f"{stage}_extract",
-        question=user,
-        prompt_mode="raw_prompt",
-        n=1,
-        temperature=0.0,
-        max_tokens=512,
-        sleep_s=sleep_s,
-        stats=stats,
-    )[0]
-    arr = _parse_json_array_loose(resp)
-    if not isinstance(arr, list) or len(arr) != len(raws):
-        # Retry once with a stricter instruction.
-        user2 = (
-            "只输出 JSON 数组（例如 [\"A\",\"\",... ]），长度必须等于 N。\n"
-            f"N={len(raws)}\n"
-            f"{attempts_block}\n"
+    def _build_prompt(one_output: str) -> str:
+        choice_lines = []
+        for k in ("A", "B", "C", "D"):
+            if k in choice_map:
+                choice_lines.append(f"{k} = {choice_map[k]}")
+        choice_block = "\n".join(choice_lines)
+        extra_rule = ""
+        if str(stage or "").strip().lower() in ("stage2", "stage3"):
+            extra_rule = '注意：答案一定在输出末尾的 "FINAL: " 关键字后面。\n'
+        return (
+            "你是“最终答案抽取器”，只负责从模型输出中抽取最终答案，禁止解题。\n"
+            "请从下面这条输出中抽取最终答案，并只输出一个字符串。\n"
+            "要求：\n"
+            "- 若是选择题，必须只输出 A/B/C/D（大写），不要输出选项内容。\n"
+            "- 若无法确定或输出里没有明确最终答案，输出空字符串 \"\"。\n"
+            "- 不要输出任何额外文字。\n"
+            f"{extra_rule}\n"
+            f"[题目]\n{question}\n\n"
+            f"[选项映射]\n{choice_block}\n\n"
+            f"[输出]\n{one_output}\n"
         ).strip()
-        resp2 = llm.generate_n(
+
+    out: List[str] = []
+    for t in raws:
+        # If upstream produced explicit error markers, do not accidentally extract numeric codes (e.g. 503).
+        if (t or "").strip().startswith("[LLM_ERROR"):
+            out.append("")
+            continue
+        user = _build_prompt(t)
+        resp = llm.generate_n(
             stage_name=f"{stage}_extract",
-            question=user2,
+            question=user,
             prompt_mode="raw_prompt",
             n=1,
             temperature=0.0,
@@ -825,18 +803,10 @@ def _llm_extract_answers_batch(
             sleep_s=sleep_s,
             stats=stats,
         )[0]
-        arr = _parse_json_array_loose(resp2)
-    if not isinstance(arr, list) or len(arr) != len(raws):
-        # Hard fallback: empty answers (still avoids false consensus).
-        out = ["" for _ in raws]
-    else:
-        out = [str(x or "").strip() for x in arr]
-        out = [(x.upper() if len(x) == 1 and x.lower() in ("a", "b", "c", "d") else x) for x in out]
-
-    # Fill short-circuited error slots.
-    for i, _t in todo:
-        short[i] = out[i]
-    return short
+        ans = (resp or "").strip()
+        ans = ans.upper() if len(ans) == 1 and ans.lower() in ("a", "b", "c", "d") else ans
+        out.append(ans)
+    return out
 
 
 def _to_result_entry(*, stage: str, final_answer: str, entry: Dict[str, Any]) -> Dict[str, Any]:
