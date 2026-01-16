@@ -119,6 +119,17 @@ Rebuild rules:
 - If `--input` is a parent directory that contains multiple run subdirectories
   (each with their own `stage1/2/3`), the subdirectory name is prepended to the
   result prefix to avoid collisions. All results are written under the parent `result/`.
+
+Optional:
+- `options.result_rebuild_use_infer=true` allows rebuilding from `stage2_infer`/`stage3_infer`
+  when archives are missing. In this mode, majority vote is computed from `extracted_answers`,
+  and the matching `raw_model_outputs` is used as `text`.
+
+Output compaction:
+- `options.compact_outputs=true` keeps only per-stage `status.*.jsonl` and `stage*_infer.*.jsonl`.
+  It disables writing `stage*_archive`, `stage*_raw_generations`, `stage*_input`, `accepted_bank`,
+  and `result` in normal modes. Parsing of `stage1_output` is still supported for compatibility.
+  In full mode, the pipeline now emits `stage1/2/3_infer` so the remaining artifacts stay minimal.
 - Summary file: `result/summary.result_rebuild.json` (counts, estimated tokens, stage breakdown)
 
 ### Stage1: infer -> eval

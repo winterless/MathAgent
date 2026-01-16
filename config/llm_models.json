@@ -73,7 +73,7 @@
     "vllm_autostart": true,
     "vllm_model_path": "/home/unlimitediw/workspace/TYDeepResearch/AgenticRLModelTraining/model/Qwen3-8B",
     "vllm_model_name": "Qwen3-8B",
-    "vllm_start_cmd": "python -m vllm.entrypoints.openai.api_server --model \"{model_path}\" --served-model-name {model_name} --dtype auto --tensor-parallel-size 1 --max-model-len 32384 --gpu-memory-utilization 0.85 --swap-space 8 --port 8000",
+    "vllm_start_cmd": "source /home/unlimitediw/miniconda/etc/profile.d/conda.sh && conda activate LLMTrain && python -m vllm.entrypoints.openai.api_server --model \"{model_path}\" --served-model-name {model_name} --dtype auto --tensor-parallel-size 1 --max-model-len 32384 --gpu-memory-utilization 0.85 --swap-space 8 --port 8000",
     "vllm_wait_s": 180,
     "vllm_health_url": "",
     "vllm_restart_on_connrefused": true,
@@ -85,6 +85,8 @@
     "vllm_shutdown_on_exit": true,
     "vllm_stop_cmd": "pkill -f vllm.entrypoints.openai.api_server || true",
     "purge_conn_errors_on_start": true,
+    "compact_outputs": true,
+    "result_rebuild_use_infer": true,
     "think_tag_default": "",
     "think_tag_by_profile": {
       "base": "",
