@@ -113,7 +113,8 @@ PYTHONPATH=src python3 src/run_pipeline.py \
 ```
 
 Rebuild rules:
-- For each infer row, emit one result per correct attempt (extracted answer matches gold).
+- Vote on `extracted_answers` and require `majority_count >= min_votes_to_accept`.
+- Emit one result per attempt whose extracted answer matches the voted answer.
 - Result schema: `{"uuid": ..., "text": "<question + reasoning + answer>"}`
 - To avoid collisions, each attempt appends its index to the uuid: `<uuid>-<attempt_idx>`
 - If `--input` is a parent directory that contains multiple run subdirectories

@@ -923,18 +923,30 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int) -> None:
         p = str(pred or "").strip()
         return f"问题：{q}\n\n思考：{r}\n\n答案：{p}"
 
-    def _iter_correct_infer_attempts(row: Dict[str, Any]) -> List[Tuple[int, str]]:
+    def _iter_majority_infer_attempts(row: Dict[str, Any]) -> List[Tuple[int, str]]:
         raws = row.get("raw_model_outputs") if isinstance(row.get("raw_model_outputs"), list) else []
         extracted = row.get("extracted_answers") if isinstance(row.get("extracted_answers"), list) else []
         if not raws or not extracted:
             return []
-        gold = row.get("answer") or row.get("gold")
         question = row.get("question")
-        if gold is None or question is None:
+        if question is None:
+            return []
+        cleaned = [str(x or "").strip() for x in extracted]
+        cleaned = [x for x in cleaned if x]
+        if not cleaned:
+            return []
+        v = majority_vote(cleaned)
+        maj_ans = str(v.majority or "").strip()
+        try:
+            threshold = int(row.get("min_votes_to_accept") or min_votes_to_accept)
+        except Exception:
+            threshold = int(min_votes_to_accept)
+        maj_cnt = int(v.majority_count or 0)
+        if not maj_ans or maj_cnt < threshold:
             return []
         results: List[Tuple[int, str]] = []
         for idx, (raw, pred) in enumerate(zip(raws, extracted)):
-            if not _match_answer(pred, gold):
+            if not _match_answer(pred, maj_ans):
                 continue
             text = _build_result_text(question, raw, pred)
             results.append((idx, text))
@@ -989,7 +1001,7 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int) -> None:
             u_str = str(u)
             if u_str in done:
                 continue
-            matches = _iter_correct_infer_attempts(row)
+            matches = _iter_majority_infer_attempts(row)
             if not matches:
                 continue
             for attempt_idx, raw_text in matches:
