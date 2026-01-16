@@ -866,7 +866,7 @@ def _result_path_for_prefix(out_dir: str, prefix: str) -> str:
     return os.path.join(result_dir, f"{pfx}result.stage_final.jsonl")
 
 
-def result_rebuild(*, out_dir: str, min_votes_to_accept: int, use_infer: bool = False) -> None:
+def result_rebuild(*, out_dir: str, min_votes_to_accept: int) -> None:
     """
     Scan output artifacts under out_dir and (re)build result/*.result.stage_final.jsonl.
     Only include rows that:
@@ -874,17 +874,13 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int, use_infer: bool = 
       - contain an attempt whose answer matches the majority answer
     Result rows only include: {"uuid", "text"} (text is raw_text of the matching attempt).
     Sources:
-      - accepted_bank.stage_final.jsonl
-      - stage2_archive.stage2.jsonl
-      - stage3_archive.stage3.jsonl
+      - stage2_infer.stage2.jsonl
+      - stage3_infer.stage3.jsonl
     """
     out_dir = str(out_dir)
-    accepted_paths = _iter_artifacts(out_dir, suffix="accepted_bank.stage_final.jsonl")
-    stage2_paths = _iter_artifacts(out_dir, suffix="stage2_archive.stage2.jsonl")
-    stage3_paths = _iter_artifacts(out_dir, suffix="stage3_archive.stage3.jsonl")
-    stage2_infer_paths = _iter_artifacts(out_dir, suffix="stage2_infer.stage2.jsonl") if use_infer else []
-    stage3_infer_paths = _iter_artifacts(out_dir, suffix="stage3_infer.stage3.jsonl") if use_infer else []
-    all_paths = accepted_paths + stage2_paths + stage3_paths + stage2_infer_paths + stage3_infer_paths
+    stage2_infer_paths = _iter_artifacts(out_dir, suffix="stage2_infer.stage2.jsonl")
+    stage3_infer_paths = _iter_artifacts(out_dir, suffix="stage3_infer.stage3.jsonl")
+    all_paths = stage2_infer_paths + stage3_infer_paths
 
     # Cache existing result uuids per prefix
     existing: Dict[str, set[str]] = {}
@@ -895,9 +891,6 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int, use_infer: bool = 
         "estimated_tokens": 0,
         "by_stage": {"stage2": 0, "stage3": 0, "unknown": 0},
         "by_source": {
-            "accepted_bank": 0,
-            "stage2_archive": 0,
-            "stage3_archive": 0,
             "stage2_infer": 0,
             "stage3_infer": 0,
         },
@@ -997,19 +990,7 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int, use_infer: bool = 
 
     for idx, pth in enumerate(all_paths, start=1):
         base = os.path.basename(pth)
-        if base.endswith("accepted_bank.stage_final.jsonl"):
-            prefix = _rebuild_prefix_for_path(pth, suffix="accepted_bank.stage_final.jsonl")
-            stage = None
-            source = "accepted_bank"
-        elif base.endswith("stage2_archive.stage2.jsonl"):
-            prefix = _rebuild_prefix_for_path(pth, suffix="stage2_archive.stage2.jsonl")
-            stage = "stage2"
-            source = "stage2_archive"
-        elif base.endswith("stage3_archive.stage3.jsonl"):
-            prefix = _rebuild_prefix_for_path(pth, suffix="stage3_archive.stage3.jsonl")
-            stage = "stage3"
-            source = "stage3_archive"
-        elif base.endswith("stage2_infer.stage2.jsonl"):
+        if base.endswith("stage2_infer.stage2.jsonl"):
             prefix = _rebuild_prefix_for_path(pth, suffix="stage2_infer.stage2.jsonl")
             stage = "stage2"
             source = "stage2_infer"
@@ -1035,10 +1016,7 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int, use_infer: bool = 
             u_str = str(u)
             if u_str in done:
                 continue
-            if source in ("stage2_infer", "stage3_infer"):
-                raw_text = _extract_text_if_majority_from_infer(row)
-            else:
-                raw_text = _extract_text_if_majority(row)
+            raw_text = _extract_text_if_majority_from_infer(row)
             if raw_text is None:
                 continue
             stats["total_candidates"] += 1
@@ -1047,14 +1025,7 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int, use_infer: bool = 
             stats["total_written"] += 1
             stats["estimated_tokens"] += _estimate_tokens(raw_text)
             stats["by_source"][source] = int(stats["by_source"].get(source, 0)) + 1
-            if stage is None:
-                accepted_from = str(row.get("accepted_from") or "")
-                if accepted_from in ("stage2", "stage3"):
-                    stats["by_stage"][accepted_from] += 1
-                else:
-                    stats["by_stage"]["unknown"] += 1
-            else:
-                stats["by_stage"][stage] += 1
+            stats["by_stage"][stage] += 1
 
         print(
             f"[result_rebuild] {idx}/{total_files} files "
@@ -3346,16 +3317,13 @@ def main() -> None:
         assert args.input
         if mode == "result_rebuild":
             # Rebuild results from existing artifacts; uses --input as out_dir.
-            use_infer = llm.option_bool("result_rebuild_use_infer", False)
             result_rebuild(
                 out_dir=str(args.input),
                 min_votes_to_accept=min_votes_to_accept,
-                use_infer=use_infer,
             )
             print("Done.")
             print(f"- mode: {mode}")
             print(f"- out_dir: {args.input}")
-            print(f"- use_infer: {use_infer}")
             return
         stage1_dir = os.path.join(args.out, "stage1") if not args.stage1 else str(args.stage1)
         stage2_dir = os.path.join(args.out, "stage2")

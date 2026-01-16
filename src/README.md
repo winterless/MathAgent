@@ -104,7 +104,7 @@ Note: the project uses `src/` as import root, so we recommend running with `PYTH
 
 ### Rebuild result/ from existing artifacts
 
-If you already have `accepted_bank` / `stage2_archive` / `stage3_archive` and want to regenerate `result/*.result.stage_final.jsonl`:
+If you already have `stage2_infer` / `stage3_infer` and want to regenerate `result/*.result.stage_final.jsonl`:
 
 ```bash
 PYTHONPATH=src python3 src/run_pipeline.py \
@@ -114,16 +114,11 @@ PYTHONPATH=src python3 src/run_pipeline.py \
 
 Rebuild rules:
 - Only include rows with `majority_count >= min_votes_to_accept`
-- Only include rows where one attempt matches the majority answer
-- Result schema: `{"uuid": ..., "text": "<raw_text>"}` (raw_text from the matching attempt)
+- Majority vote is computed from `extracted_answers`, and the matching `raw_model_outputs` is used as `text`
+- Result schema: `{"uuid": ..., "text": "<raw_text>"}`
 - If `--input` is a parent directory that contains multiple run subdirectories
   (each with their own `stage1/2/3`), the subdirectory name is prepended to the
   result prefix to avoid collisions. All results are written under the parent `result/`.
-
-Optional:
-- `options.result_rebuild_use_infer=true` allows rebuilding from `stage2_infer`/`stage3_infer`
-  when archives are missing. In this mode, majority vote is computed from `extracted_answers`,
-  and the matching `raw_model_outputs` is used as `text`.
 
 Output compaction:
 - `options.compact_outputs=true` keeps only per-stage `status.*.jsonl` and `stage*_infer.*.jsonl`.

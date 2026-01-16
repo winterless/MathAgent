@@ -86,7 +86,6 @@
     "vllm_stop_cmd": "pkill -f vllm.entrypoints.openai.api_server || true",
     "purge_conn_errors_on_start": true,
     "compact_outputs": true,
-    "result_rebuild_use_infer": true,
     "think_tag_default": "",
     "think_tag_by_profile": {
       "base": "",
