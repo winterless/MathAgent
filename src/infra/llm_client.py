@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import subprocess
+import shlex
 import time
 import urllib.error
 import urllib.request
@@ -26,6 +27,8 @@ class RecoveryConfig:
     restart_on_connrefused: bool = False
     restart_on_runtime_error: bool = False
     restart_cooldown_s: float = 30.0
+    log_path: str = ""
+    log_to_stderr: bool = True
 
 
 @dataclass(frozen=True)
@@ -91,16 +94,28 @@ class LLMClient:
         if log:
             print(f"[LLM] running restart cmd: {cmd}", file=sys.stderr, flush=True)
         try:
+            log_path = (self.recovery.log_path or "").strip()
+            use_tee = bool(self.recovery.log_to_stderr) and bool(log_path)
+            if use_tee and "tee -a" not in cmd:
+                log_q = shlex.quote(log_path)
+                wrapped = f"set -x; set -o pipefail; {cmd} 2>&1 | tee -a {log_q} >&2"
+            else:
+                wrapped = f"set -x; {cmd}"
             if log:
-                subprocess.Popen(
-                    ["bash", "-lc", cmd],
+                proc = subprocess.Popen(
+                    ["bash", "-lc", wrapped],
                     stdout=None,
                     stderr=None,
                     start_new_session=True,
                 )
+                print(f"[LLM] restart cmd pid={proc.pid}", file=sys.stderr, flush=True)
+                time.sleep(0.2)
+                rc = proc.poll()
+                if rc is not None:
+                    print(f"[LLM] restart cmd exited rc={rc}", file=sys.stderr, flush=True)
             else:
                 subprocess.Popen(
-                    ["bash", "-lc", cmd],
+                    ["bash", "-lc", wrapped],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
@@ -296,16 +311,28 @@ class LLMClient:
             if log:
                 print(f"[LLM] running restart cmd: {cmd}", file=sys.stderr, flush=True)
             try:
+                log_path = (self.recovery.log_path or "").strip()
+                use_tee = bool(self.recovery.log_to_stderr) and bool(log_path)
+                if use_tee and "tee -a" not in cmd:
+                    log_q = shlex.quote(log_path)
+                    wrapped = f"set -x; set -o pipefail; {cmd} 2>&1 | tee -a {log_q} >&2"
+                else:
+                    wrapped = f"set -x; {cmd}"
                 if log:
-                    subprocess.Popen(
-                        ["bash", "-lc", cmd],
+                    proc = subprocess.Popen(
+                        ["bash", "-lc", wrapped],
                         stdout=None,
                         stderr=None,
                         start_new_session=True,
                     )
+                    print(f"[LLM] restart cmd pid={proc.pid}", file=sys.stderr, flush=True)
+                    time.sleep(0.2)
+                    rc = proc.poll()
+                    if rc is not None:
+                        print(f"[LLM] restart cmd exited rc={rc}", file=sys.stderr, flush=True)
                 else:
                     subprocess.Popen(
-                        ["bash", "-lc", cmd],
+                        ["bash", "-lc", wrapped],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         start_new_session=True,

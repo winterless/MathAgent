@@ -228,6 +228,8 @@ class LLMRouter:
 
         wait_s = self.option_int("vllm_wait_s", 0)
         health_url = self.vllm_health_url_resolved()
+        log_path = str(self._options.get("vllm_log_path") or "").strip() or "/tmp/mathagent_vllm.log"
+        log_to_stderr = self.option_bool("vllm_log_to_stderr", True)
 
         cfg = RecoveryConfig(
             wait_on_connrefused_s=float(wait_s),
@@ -237,6 +239,8 @@ class LLMRouter:
             restart_on_connrefused=self.option_bool("vllm_restart_on_connrefused", False),
             restart_on_runtime_error=self.option_bool("vllm_restart_on_runtime_error", False),
             restart_cooldown_s=float(self.option_int("vllm_restart_cooldown_s", 30)),
+            log_path=log_path,
+            log_to_stderr=log_to_stderr,
         )
         for c in self._clients.values():
             c.set_recovery_config(cfg)
