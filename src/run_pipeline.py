@@ -14,6 +14,7 @@ import sys
 import time
 import re
 import subprocess
+import shlex
 import urllib.request
 import urllib.error
 import atexit
@@ -114,31 +115,38 @@ def _maybe_autostart_vllm(llm: LLMRouter) -> bool:
     if health_url and _health_ok(health_url, timeout_s=2.0):
         return False
 
-    log_path = llm.option_str("vllm_log_path", "").strip()
-    if not log_path:
-        log_path = "/tmp/mathagent_vllm.log"
-    try:
-        log_f = open(log_path, "ab")
-    except Exception:
-        log_f = None
+    log_path = llm.option_str("vllm_log_path", "").strip() or "/tmp/mathagent_vllm.log"
+    log_to_stderr = llm.option_bool("vllm_log_to_stderr", True)
 
     start_with_bash = llm.option_bool("vllm_start_with_bash", False)
     try:
-        if start_with_bash:
+        if log_to_stderr:
+            # Tee vLLM logs to stderr so terminal shows raw startup/runtime logs.
+            log_q = shlex.quote(log_path)
+            tee_cmd = f"{cmd} 2>&1 | tee -a {log_q} >&2"
             subprocess.Popen(
-                ["bash", "-lc", cmd],
-                stdout=log_f or subprocess.DEVNULL,
-                stderr=log_f or subprocess.DEVNULL,
+                ["bash", "-lc", tee_cmd],
+                stdout=None,
+                stderr=None,
                 start_new_session=True,
             )
+        elif start_with_bash:
+            with open(log_path, "ab") as log_f:
+                subprocess.Popen(
+                    ["bash", "-lc", cmd],
+                    stdout=log_f,
+                    stderr=log_f,
+                    start_new_session=True,
+                )
         else:
-            subprocess.Popen(
-                cmd,
-                shell=True,
-                stdout=log_f or subprocess.DEVNULL,
-                stderr=log_f or subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            with open(log_path, "ab") as log_f:
+                subprocess.Popen(
+                    cmd,
+                    shell=True,
+                    stdout=log_f,
+                    stderr=log_f,
+                    start_new_session=True,
+                )
     except Exception as e:
         print(f"[WARN] vLLM autostart failed to spawn: {e}", file=sys.stderr, flush=True)
         return False

@@ -91,7 +91,20 @@ class LLMClient:
         if log:
             print(f"[LLM] running restart cmd: {cmd}", file=sys.stderr, flush=True)
         try:
-            subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if log:
+                subprocess.Popen(
+                    ["bash", "-lc", cmd],
+                    stdout=None,
+                    stderr=None,
+                    start_new_session=True,
+                )
+            else:
+                subprocess.Popen(
+                    ["bash", "-lc", cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
         except Exception as e:
             if log:
                 print(f"[LLM] restart cmd failed to spawn: {e}", file=sys.stderr, flush=True)
@@ -283,7 +296,20 @@ class LLMClient:
             if log:
                 print(f"[LLM] running restart cmd: {cmd}", file=sys.stderr, flush=True)
             try:
-                subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if log:
+                    subprocess.Popen(
+                        ["bash", "-lc", cmd],
+                        stdout=None,
+                        stderr=None,
+                        start_new_session=True,
+                    )
+                else:
+                    subprocess.Popen(
+                        ["bash", "-lc", cmd],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
             except Exception as e:
                 if log:
                     print(f"[LLM] restart cmd failed to spawn: {e}", file=sys.stderr, flush=True)
@@ -406,6 +432,8 @@ class LLMClient:
                 if err_no == 111:
                     # Connection refused: server not listening / crashed.
                     _bump("errors", 1)
+                    if self.recovery.connrefused_log:
+                        print("[LLM] connection refused; attempting recovery...", file=sys.stderr, flush=True)
                     recovered = _wait_for_health(
                         wait_s=connrefused_wait_s,
                         restart_cmd=restart_cmd,
@@ -498,7 +526,8 @@ class LLMClient:
                 if now - _LAST_RESTART_TS < cooldown_s:
                     return
                 _LAST_RESTART_TS = now
-            self._spawn_restart(cmd, log=False)
+            print("[LLM] runtime error detected; restarting...", file=sys.stderr, flush=True)
+            self._spawn_restart(cmd, log=True)
 
         mode = (prompt_mode or "problem").strip().lower()
         if mode in ("raw_prompt", "raw_prompt_eval"):

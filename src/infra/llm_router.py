@@ -233,7 +233,7 @@ class LLMRouter:
             wait_on_connrefused_s=float(wait_s),
             health_url=health_url,
             restart_cmd=restart_cmd,
-            connrefused_log=self.option_bool("vllm_connrefused_log", False),
+            connrefused_log=self.option_bool("vllm_connrefused_log", True),
             restart_on_connrefused=self.option_bool("vllm_restart_on_connrefused", False),
             restart_on_runtime_error=self.option_bool("vllm_restart_on_runtime_error", False),
             restart_cooldown_s=float(self.option_int("vllm_restart_cooldown_s", 30)),
