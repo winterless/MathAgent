@@ -96,6 +96,74 @@ def _wait_for_health(url: str, wait_s: float) -> bool:
     return False
 
 
+def _maybe_prestart_vllm(llm: LLMRouter) -> None:
+    """
+    Best-effort cleanup before vLLM start: optional nvidia-smi, gpu reset, and stop_cmd.
+    """
+    if not llm.option_bool("vllm_autostart_force_reset_and_kill", False):
+        return
+    # Print current GPU status.
+    if llm.option_bool("vllm_pre_restart_nvidia_smi", False):
+        try:
+            res = subprocess.run(
+                ["nvidia-smi"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            print("[vLLM] prestart nvidia-smi:", file=sys.stderr, flush=True)
+            print(res.stdout or "", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[vLLM] prestart nvidia-smi failed: {e}", file=sys.stderr, flush=True)
+
+    # Optional GPU reset.
+    if llm.option_bool("vllm_gpu_reset_on_restart", False):
+        ids = str(llm.option_str("vllm_gpu_reset_ids", "") or "").strip().lower()
+        if ids in ("all", "*"):
+            try:
+                res = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                )
+                lines = [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()]
+                ids = ",".join(lines)
+            except Exception as e:
+                print(f"[vLLM] gpu reset: failed to list gpu ids: {e}", file=sys.stderr, flush=True)
+                ids = ""
+        if ids and ids not in ("none", "false", "off"):
+            try:
+                reset_cmd = ["sudo", "-n", "nvidia-smi", "--gpu-reset", "-i", ids]
+                print(f"[vLLM] prestart gpu reset: {' '.join(reset_cmd)}", file=sys.stderr, flush=True)
+                res = subprocess.run(
+                    reset_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                )
+                print(res.stdout or "", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[vLLM] gpu reset failed: {e}", file=sys.stderr, flush=True)
+
+    # Stop vLLM process if configured.
+    stop_cmd = llm.option_str("vllm_stop_cmd", "").strip()
+    if stop_cmd:
+        print(f"[vLLM] prestart stop cmd: {stop_cmd}", file=sys.stderr, flush=True)
+        try:
+            subprocess.Popen(["bash", "-lc", stop_cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"[vLLM] prestart stop cmd failed: {e}", file=sys.stderr, flush=True)
+
+    # Optional delay before starting.
+    delay_s = float(llm.option_int("vllm_restart_delay_s", 0))
+    if delay_s > 0:
+        time.sleep(delay_s)
+
+
 def _maybe_autostart_vllm(llm: LLMRouter) -> bool:
     """
     If enabled in config, start vLLM on pipeline startup and wait for health.
@@ -123,6 +191,7 @@ def _maybe_autostart_vllm(llm: LLMRouter) -> bool:
 
     start_with_bash = llm.option_bool("vllm_start_with_bash", False)
     try:
+        _maybe_prestart_vllm(llm)
         if use_restart_on_autostart and restart_cmd:
             print(f"[vLLM] autostart using restart cmd: {cmd}", file=sys.stderr, flush=True)
         if log_to_stderr:
