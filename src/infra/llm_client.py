@@ -11,7 +11,6 @@ import urllib.request
 import concurrent.futures
 import threading
 from dataclasses import dataclass
-import shlex
 from typing import Any, Callable, Dict, List, Optional
 
 
@@ -32,6 +31,9 @@ class RecoveryConfig:
     restart_fallback_to_start: bool = True
     log_path: str = ""
     log_to_stderr: bool = True
+    pre_restart_nvidia_smi: bool = False
+    gpu_reset_on_restart: bool = False
+    gpu_reset_ids: str = ""
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,55 @@ class LLMClient:
             return
         if log:
             print(f"[LLM] running restart cmd: {cmd}", file=sys.stderr, flush=True)
+
+        def _run_pre_restart() -> None:
+            if self.recovery.pre_restart_nvidia_smi:
+                try:
+                    res = subprocess.run(
+                        ["nvidia-smi"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        check=False,
+                    )
+                    print("[LLM] pre-restart nvidia-smi:", file=sys.stderr, flush=True)
+                    print(res.stdout or "", file=sys.stderr, flush=True)
+                except Exception as e:
+                    print(f"[LLM] pre-restart nvidia-smi failed: {e}", file=sys.stderr, flush=True)
+            if not self.recovery.gpu_reset_on_restart:
+                return
+            ids = str(self.recovery.gpu_reset_ids or "").strip().lower()
+            if ids in ("", "none", "false", "off"):
+                return
+            if ids in ("all", "*"):
+                try:
+                    res = subprocess.run(
+                        ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        check=False,
+                    )
+                    lines = [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()]
+                    ids = ",".join(lines)
+                except Exception as e:
+                    print(f"[LLM] gpu reset: failed to list gpu ids: {e}", file=sys.stderr, flush=True)
+                    return
+            if not ids:
+                return
+            try:
+                reset_cmd = ["sudo", "-n", "nvidia-smi", "--gpu-reset", "-i", ids]
+                print(f"[LLM] pre-restart gpu reset: {' '.join(reset_cmd)}", file=sys.stderr, flush=True)
+                res = subprocess.run(
+                    reset_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                )
+                print(res.stdout or "", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[LLM] gpu reset failed: {e}", file=sys.stderr, flush=True)
         def _spawn_one(cmd_in: str, *, label: str) -> int | None:
             try:
                 log_path = (self.recovery.log_path or "").strip()
@@ -130,6 +181,7 @@ class LLMClient:
                     print(f"[LLM] {label} failed to spawn: {e}", file=sys.stderr, flush=True)
                 return None
 
+        _run_pre_restart()
         rc = _spawn_one(cmd, label="restart cmd")
         if (
             rc is not None

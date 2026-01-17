@@ -230,6 +230,9 @@ class LLMRouter:
         health_url = self.vllm_health_url_resolved()
         log_path = str(self._options.get("vllm_log_path") or "").strip() or "/tmp/mathagent_vllm.log"
         log_to_stderr = self.option_bool("vllm_log_to_stderr", True)
+        pre_restart_nvidia_smi = self.option_bool("vllm_pre_restart_nvidia_smi", True)
+        gpu_reset_on_restart = self.option_bool("vllm_gpu_reset_on_restart", True)
+        gpu_reset_ids = str(self._options.get("vllm_gpu_reset_ids") or "all").strip()
 
         cfg = RecoveryConfig(
             wait_on_connrefused_s=float(wait_s),
@@ -243,6 +246,9 @@ class LLMRouter:
             restart_fallback_to_start=self.option_bool("vllm_restart_fallback_to_start", True),
             log_path=log_path,
             log_to_stderr=log_to_stderr,
+            pre_restart_nvidia_smi=pre_restart_nvidia_smi,
+            gpu_reset_on_restart=gpu_reset_on_restart,
+            gpu_reset_ids=gpu_reset_ids,
         )
         for c in self._clients.values():
             c.set_recovery_config(cfg)
