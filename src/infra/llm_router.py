@@ -220,9 +220,13 @@ class LLMRouter:
         start_cmd = self.vllm_start_cmd_resolved()
         stop_cmd = str(self._options.get("vllm_stop_cmd") or "").strip()
         restart_cmd = str(self._options.get("vllm_restart_cmd") or "").strip()
+        restart_delay_s = float(self.option_int("vllm_restart_delay_s", 0))
         if not restart_cmd:
             if stop_cmd and start_cmd:
-                restart_cmd = f"{stop_cmd}; {start_cmd}"
+                if restart_delay_s > 0:
+                    restart_cmd = f"{stop_cmd}; sleep {restart_delay_s:.1f}; {start_cmd}"
+                else:
+                    restart_cmd = f"{stop_cmd}; {start_cmd}"
             else:
                 restart_cmd = start_cmd
 
@@ -233,6 +237,7 @@ class LLMRouter:
         pre_restart_nvidia_smi = self.option_bool("vllm_pre_restart_nvidia_smi", True)
         gpu_reset_on_restart = self.option_bool("vllm_gpu_reset_on_restart", True)
         gpu_reset_ids = str(self._options.get("vllm_gpu_reset_ids") or "all").strip()
+        gpu_reset_cmd = str(self._options.get("vllm_gpu_reset_cmd") or "").strip()
 
         cfg = RecoveryConfig(
             wait_on_connrefused_s=float(wait_s),
@@ -249,6 +254,7 @@ class LLMRouter:
             pre_restart_nvidia_smi=pre_restart_nvidia_smi,
             gpu_reset_on_restart=gpu_reset_on_restart,
             gpu_reset_ids=gpu_reset_ids,
+            gpu_reset_cmd=gpu_reset_cmd,
         )
         for c in self._clients.values():
             c.set_recovery_config(cfg)

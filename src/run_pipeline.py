@@ -103,7 +103,10 @@ def _maybe_autostart_vllm(llm: LLMRouter) -> bool:
     if not llm.option_bool("vllm_autostart", False):
         return False
 
-    cmd = llm.vllm_start_cmd_resolved()
+    start_cmd = llm.vllm_start_cmd_resolved()
+    restart_cmd = llm.option_str("vllm_restart_cmd", "").strip()
+    use_restart_on_autostart = llm.option_bool("vllm_autostart_use_restart_cmd", True)
+    cmd = restart_cmd if (use_restart_on_autostart and restart_cmd) else start_cmd
     if not cmd:
         return False
 
@@ -120,6 +123,8 @@ def _maybe_autostart_vllm(llm: LLMRouter) -> bool:
 
     start_with_bash = llm.option_bool("vllm_start_with_bash", False)
     try:
+        if use_restart_on_autostart and restart_cmd:
+            print(f"[vLLM] autostart using restart cmd: {cmd}", file=sys.stderr, flush=True)
         if log_to_stderr:
             # Tee vLLM logs to stderr so terminal shows raw startup/runtime logs.
             log_q = shlex.quote(log_path)

@@ -91,7 +91,12 @@
       "base": "",
       "think_fast": "/no_think",
       "think_slow": "/think"
-    }
+    },
+    "vllm_pre_restart_nvidia_smi": true,
+    "vllm_gpu_reset_on_restart": true,
+    "vllm_gpu_reset_ids": "all",
+    "vllm_autostart_use_restart_cmd": true,
+    "vllm_restart_delay_s": 3
   },
   "routes": {
     "default": "base",

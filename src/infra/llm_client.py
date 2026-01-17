@@ -34,6 +34,7 @@ class RecoveryConfig:
     pre_restart_nvidia_smi: bool = False
     gpu_reset_on_restart: bool = False
     gpu_reset_ids: str = ""
+    gpu_reset_cmd: str = ""
 
 
 @dataclass(frozen=True)
@@ -135,10 +136,16 @@ class LLMClient:
             if not ids:
                 return
             try:
-                reset_cmd = ["sudo", "-n", "nvidia-smi", "--gpu-reset", "-i", ids]
-                print(f"[LLM] pre-restart gpu reset: {' '.join(reset_cmd)}", file=sys.stderr, flush=True)
+                reset_cmd = (self.recovery.gpu_reset_cmd or "").strip()
+                if reset_cmd:
+                    reset_cmd = reset_cmd.replace("{gpu_ids}", ids)
+                    cmd_list = ["bash", "-lc", reset_cmd]
+                    print(f"[LLM] pre-restart gpu reset: {reset_cmd}", file=sys.stderr, flush=True)
+                else:
+                    cmd_list = ["sudo", "-n", "nvidia-smi", "--gpu-reset", "-i", ids]
+                    print(f"[LLM] pre-restart gpu reset: {' '.join(cmd_list)}", file=sys.stderr, flush=True)
                 res = subprocess.run(
-                    reset_cmd,
+                    cmd_list,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
