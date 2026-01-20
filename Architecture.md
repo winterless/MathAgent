@@ -2,6 +2,21 @@
 
 ![Architecture](others/diagrams/architecture.png)
 
+### Pipeline 流程图（更新版）
+
+> 说明：忽略 run_infer.sh / simple_pipeline.py，仅描述实际 pipeline 的阶段流转。
+
+```mermaid
+flowchart TD
+    A[run_pipeline.py] --> B[stage1_output.stage1.jsonl]
+    B --> C[stage1_eval]
+    C --> D[stage2_infer]
+    D --> E[stage2_eval]
+    E --> F[stage3_infer]
+    F --> G[stage3_eval]
+    G --> H[result_rebuild]
+```
+
 ### 源码分层（真实目录）
 
 - **CLI / Orchestration**：`src/run_pipeline.py`
