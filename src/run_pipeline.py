@@ -611,7 +611,6 @@ class _UUIDProgress:
 
 # ---- Route-A modular modes (infer/eval split for stage2/stage3) ----
 MODES = [
-    "full",
     "stage1_infer",
     "stage1_eval",
     "stage2_infer",
@@ -843,32 +842,6 @@ def _append_stage_infer_row(
     )
 
 
-def _to_result_entry(*, stage: str, final_answer: str, entry: Dict[str, Any]) -> Dict[str, Any]:
-    """Minimal result entry (stage2/stage3 only)."""
-    answer = entry.get("answer")
-    answer = (answer or "").strip() if isinstance(answer, str) else ""
-    attempts = entry.get("attempts") if isinstance(entry.get("attempts"), list) else []
-    attempts_slim: List[Dict[str, Any]] = []
-    for a in attempts:
-        if not isinstance(a, dict):
-            continue
-        attempts_slim.append(
-            {
-                "raw_text": a.get("raw_text"),
-                "boxed_answer": a.get("boxed_answer"),
-                "verdict": a.get("verdict"),
-                "final_answer": final_answer,
-            }
-        )
-    return {
-        "uuid": entry.get("uuid"),
-        "question": entry.get("question"),
-        "answer": answer,
-        "stage": stage,
-        "final_answer": final_answer,
-        "majority_answer": entry.get("majority_answer"),
-        "attempts": attempts_slim,
-    }
 
 
 def _result_path_for_prefix(out_dir: str, prefix: str) -> str:
@@ -3226,11 +3199,10 @@ def main() -> None:
     p = argparse.ArgumentParser(description="MathAgent minimal pipeline (JSONL between stages).")
     p.add_argument(
         "--mode",
-        default="full",
+        required=True,
         choices=MODES,
         help=(
-            "Execution mode. 'full' runs the original pipeline.\n"
-            "Route-A modular modes:\n"
+            "Execution mode (modular only):\n"
             "  - stage2_infer: input is stage1_output.stage1.jsonl (or a dir of them) -> emit stage2_infer\n"
             "  - stage2_eval: input is stage2_infer.stage2.jsonl (or a dir of them) -> emit stage2 status + stage3_input\n"
             "  - stage3_infer: input is stage3_input.stage3.jsonl (or a dir of them) -> emit stage3_infer\n"
@@ -3251,13 +3223,9 @@ def main() -> None:
 
     os.makedirs(args.out, exist_ok=True)
 
-    mode = str(args.mode or "full").strip()
-    if mode != "full":
-        if not args.input:
-            raise ValueError("--mode is not 'full': must provide --input as the artifact path (file or directory).")
-    else:
-        if not args.input:
-            raise ValueError("Must provide --input in full mode")
+    mode = str(args.mode or "").strip()
+    if not args.input:
+        raise ValueError("--mode requires --input as the artifact path (file or directory).")
 
     llm = LLMRouter(config_path=args.llm_config)
     llm.override_options(
@@ -3283,138 +3251,86 @@ def main() -> None:
                 flush=True,
             )
     # ---- Route-A modular modes ----
-    if mode != "full":
-        assert args.input
-        if mode == "result_rebuild":
-            # Rebuild results from existing artifacts; uses --input as out_dir.
-            result_rebuild(
-                out_dir=str(args.input),
-                min_votes_to_accept=min_votes_to_accept,
-            )
-            print("Done.")
-            print(f"- mode: {mode}")
-            print(f"- out_dir: {args.input}")
-            return
-        stage1_dir = os.path.join(args.out, "stage1")
-        stage2_dir = os.path.join(args.out, "stage2")
-        stage3_dir = os.path.join(args.out, "stage3")
-        # In multi-worker setups, many environments may share the same `--out` directory.
-        # Directory creation must be idempotent and must not fail if the directories already exist.
-        os.makedirs(stage1_dir, exist_ok=True)
-        os.makedirs(stage2_dir, exist_ok=True)
-        os.makedirs(stage3_dir, exist_ok=True)
-
-        started_by_us = _maybe_autostart_vllm(llm)
-        if llm.option_bool("vllm_shutdown_on_exit", False):
-            # Always honor shutdown_on_exit; if you only want to stop when we started it, set vllm_stop_cmd accordingly.
-            atexit.register(_maybe_shutdown_vllm, llm)
-        if mode == "stage1_infer":
-            outs = mode_stage1_infer(
-                input_arg=args.input,
-                out_dir=args.out,
-                llm=llm,
-                min_votes_to_accept=min_votes_to_accept,
-                sleep_s=float(args.sleep),
-            )
-        elif mode == "stage1_eval":
-            outs = mode_stage1_eval(
-                input_arg=args.input,
-                out_dir=args.out,
-                llm=llm,
-                min_votes_to_accept=min_votes_to_accept,
-                sleep_s=float(args.sleep),
-            )
-        elif mode == "stage2_infer":
-            outs = mode_stage2_infer(
-                input_arg=args.input,
-                out_dir=args.out,
-                llm=llm,
-                min_votes_to_accept=min_votes_to_accept,
-                sleep_s=float(args.sleep),
-            )
-        elif mode == "stage2_eval":
-            outs = mode_stage2_eval(
-                input_arg=args.input,
-                out_dir=args.out,
-                llm=llm,
-                min_votes_to_accept=min_votes_to_accept,
-                sleep_s=float(args.sleep),
-            )
-        elif mode == "stage3_infer":
-            outs = mode_stage3_infer(
-                input_arg=args.input,
-                out_dir=args.out,
-                llm=llm,
-                min_votes_to_accept=min_votes_to_accept,
-                sleep_s=float(args.sleep),
-            )
-        elif mode == "stage3_eval":
-            outs = mode_stage3_eval(
-                input_arg=args.input,
-                out_dir=args.out,
-                llm=llm,
-                min_votes_to_accept=min_votes_to_accept,
-                sleep_s=float(args.sleep),
-            )
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
-
+    assert args.input
+    if mode == "result_rebuild":
+        # Rebuild results from existing artifacts; uses --input as out_dir.
+        result_rebuild(
+            out_dir=str(args.input),
+            min_votes_to_accept=min_votes_to_accept,
+        )
         print("Done.")
         print(f"- mode: {mode}")
-        print(f"- input: {args.input}")
-        print(f"- out_dir: {args.out}")
-        for pth in outs:
-            print(f"- output: {pth}")
+        print(f"- out_dir: {args.input}")
         return
 
     stage1_dir = os.path.join(args.out, "stage1")
     stage2_dir = os.path.join(args.out, "stage2")
     stage3_dir = os.path.join(args.out, "stage3")
-    # In multi-worker setups, many environments may share the same `--out` directory.
-    # Directory creation must be idempotent and must not fail if the directories already exist.
     os.makedirs(stage1_dir, exist_ok=True)
     os.makedirs(stage2_dir, exist_ok=True)
     os.makedirs(stage3_dir, exist_ok=True)
 
-    started_by_us = _maybe_autostart_vllm(llm)
+    _maybe_autostart_vllm(llm)
     if llm.option_bool("vllm_shutdown_on_exit", False):
-        # Always honor shutdown_on_exit; if you only want to stop when we started it, set vllm_stop_cmd accordingly.
         atexit.register(_maybe_shutdown_vllm, llm)
 
-    assert args.input
-    # Directory input mode: run once per *.jsonl file, prefixing outputs by filename stem.
-    if os.path.isdir(args.input):
-        input_paths = _iter_input_jsonl_paths(args.input)
-        if not input_paths:
-            raise ValueError(f"--input is a directory but has no *.jsonl files: {args.input}")
-        for input_path in input_paths:
-            prefix = _input_prefix(input_path)
-            _run_one_input(
-                input_path=input_path,
-                prefix=prefix,
-                out_dir=args.out,
-                stage1_dir=stage1_dir,
-                stage2_dir=stage2_dir,
-                stage3_dir=stage3_dir,
-                llm=llm,
-                min_votes_to_accept=min_votes_to_accept,
-                sleep_s=float(args.sleep),
-            )
-        return
+    if mode == "stage1_infer":
+        outs = mode_stage1_infer(
+            input_arg=args.input,
+            out_dir=args.out,
+            llm=llm,
+            min_votes_to_accept=min_votes_to_accept,
+            sleep_s=float(args.sleep),
+        )
+    elif mode == "stage1_eval":
+        outs = mode_stage1_eval(
+            input_arg=args.input,
+            out_dir=args.out,
+            llm=llm,
+            min_votes_to_accept=min_votes_to_accept,
+            sleep_s=float(args.sleep),
+        )
+    elif mode == "stage2_infer":
+        outs = mode_stage2_infer(
+            input_arg=args.input,
+            out_dir=args.out,
+            llm=llm,
+            min_votes_to_accept=min_votes_to_accept,
+            sleep_s=float(args.sleep),
+        )
+    elif mode == "stage2_eval":
+        outs = mode_stage2_eval(
+            input_arg=args.input,
+            out_dir=args.out,
+            llm=llm,
+            min_votes_to_accept=min_votes_to_accept,
+            sleep_s=float(args.sleep),
+        )
+    elif mode == "stage3_infer":
+        outs = mode_stage3_infer(
+            input_arg=args.input,
+            out_dir=args.out,
+            llm=llm,
+            min_votes_to_accept=min_votes_to_accept,
+            sleep_s=float(args.sleep),
+        )
+    elif mode == "stage3_eval":
+        outs = mode_stage3_eval(
+            input_arg=args.input,
+            out_dir=args.out,
+            llm=llm,
+            min_votes_to_accept=min_votes_to_accept,
+            sleep_s=float(args.sleep),
+        )
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
 
-    # Single-file mode: run through the unified implementation.
-    # Use input filename stem as output prefix (same convention as directory mode).
-    _run_one_input(
-        input_path=args.input,
-        prefix=_input_prefix(args.input),
-        out_dir=args.out,
-        stage1_dir=stage1_dir,
-        stage2_dir=stage2_dir,
-        stage3_dir=stage3_dir,
-        llm=llm,
-        min_votes_to_accept=min_votes_to_accept,
-        sleep_s=float(args.sleep),
-    )
+    print("Done.")
+    print(f"- mode: {mode}")
+    print(f"- input: {args.input}")
+    print(f"- out_dir: {args.out}")
+    for pth in outs:
+        print(f"- output: {pth}")
     return
 
 

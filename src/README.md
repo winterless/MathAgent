@@ -14,13 +14,15 @@ Each line must be a JSON object with at least one of:
 Example: `datasets/example_input.jsonl`
 
 ## Run (real OpenAI-compatible API)
-### Use the model routing config (single mode)
+### Use the model routing config (modular modes)
 
 Edit `config/llm_models.json` to describe your **three models** (e.g. 30B 快思考 / 30B 慢思考 / 基础模型),
-and how each pipeline stage routes to them, then run:
+and how each pipeline stage routes to them.
+
+Note: the CLI entrypoint `src/run_pipeline.py` no longer provides a `full` mode; the full-chain run is expected to be wrapped by your external script. Use the modular `--mode` commands below.
 
 ```bash
-python src/run_pipeline.py --input datasets/example_input.jsonl --out datasets/out/demo --llm-config config/llm_models.json
+PYTHONPATH=src python3 src/run_pipeline.py --mode stage1_infer --input datasets/example_input.jsonl --out datasets/out/demo --llm-config config/llm_models.json
 ```
 
 Optional flags:
