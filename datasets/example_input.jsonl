@@ -1,1 +1,0 @@
-{"source_category":"","text":"问题","uuid":"ex-1","provider":"demo","version":"v0","xx_version":"v0","aigc_modelname":"demo","language":"zh-cn","raw_source_path":"datasets/example_input.jsonl","prompt":"","question":"计算 $123^{2025}$ 除以 $1001$ 的余数是（ ）\\nA.966\\nB.967\\nC.968\\nD.965","answer":"B","line_number":1,"output":{}}
