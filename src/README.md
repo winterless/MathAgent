@@ -200,3 +200,11 @@ PYTHONPATH=src python3 src/run_pipeline.py \
   --llm-config config/llm_models.json
 ```
 
+```bash
+PYTHONPATH=src python3 src/run_pipeline.py \
+  --mode result_rebuild \
+  --input datasets/out/demo_modular \
+  --out datasets/out/demo_modular \
+  --llm-config config/llm_models.json
+```
+

@@ -135,6 +135,6 @@ Stage3 结构与 Stage2 类似：
 - **抽取优先级**：`extract_boxed_answer` > `extract_final_answer`；抽取结果为空时不会参与投票
 - **规则判别优先**：`rule_equivalent` 返回 True/False 即直接判定，只有 `None` 才会调用 LLM judge
 - **多数投票口径**：投票基于“规范化后的答案字符串”，并过滤空答案以避免错误伪共识
-- **Stage2/3 final 规则**：`majority_count >= min_votes_to_accept` 则 `final_source="majority"`；否则 `final_source="answer_fallback"`（fallback = gold）
+- **Stage2/3 final 规则**：`majority_count >= min_votes_to_accept` 则 `final_source="majority"`；否则 `final_source="no_majority"`（没有答案，不回退到 gold）
 - **Result 只收 majority**：`result/*.result.stage_final.jsonl` 仅收录 `final_source="majority"` 的样本
 
