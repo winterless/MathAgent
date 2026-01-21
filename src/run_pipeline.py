@@ -814,16 +814,29 @@ def _llm_vote_majority_from_extracted(
     prompts_obj = llm.option_any("prompts", {}) if hasattr(llm, "option_any") else {}
     tmpl = default_template
     if isinstance(prompts_obj, dict):
-        v = prompts_obj.get("vote_majority")
+        # Prefer the newer key name, but keep backward compatibility.
+        v = prompts_obj.get("majority_vote")
+        if not (isinstance(v, str) and v.strip()):
+            v = prompts_obj.get("vote_majority")
         if isinstance(v, str) and v.strip():
             tmpl = v
     from string import Template
 
-    prompt = Template(str(tmpl)).safe_substitute(
+    # Render user prompt from template, but ALWAYS append the concrete input payload
+    # (question + raw candidates) to ensure traceability in vote_model_input.
+    rendered = Template(str(tmpl)).safe_substitute(
         question=str(question or "").strip(),
         choice_block=str(choice_block or ""),
         candidates=str(items or ""),
-    )
+    ).strip()
+    q_payload = str(question or "").strip()
+    # Use a JSON array for candidates to avoid ambiguity / numbering artifacts.
+    cand_payload = json.dumps(answers, ensure_ascii=False)
+    prompt = (
+        f"{rendered}\n\n"
+        f"[题目]\n{q_payload}\n\n"
+        f"[候选答案]\n{cand_payload}\n"
+    ).strip()
 
     resp = llm.generate_n(
         stage_name=f"{stage}_vote",
@@ -831,7 +844,8 @@ def _llm_vote_majority_from_extracted(
         prompt_mode="raw_prompt",
         n=1,
         temperature=0.0,
-        max_tokens=512,
+        # Do NOT hardcode max_tokens here; use stage_params(<stage>_vote) from config
+        # so JSON output won't be truncated by an arbitrary small limit.
         sleep_s=sleep_s,
         stats=stats,
     )[0]
@@ -856,13 +870,24 @@ def _llm_vote_majority_from_extracted(
             return obj if isinstance(obj, dict) else {}
         except Exception:
             pass
-        # Best-effort: extract the outermost {...}
+        # Best-effort: extract the LAST valid JSON object in the text.
+        # Rationale: model may output long <think> with many LaTeX braces '{...}',
+        # and a JSON blob at the end. A naive s.find("{") will hit LaTeX first.
         try:
-            i = s.find("{")
-            j = s.rfind("}")
-            if i >= 0 and j > i:
-                obj = json.loads(s[i : j + 1])
-                return obj if isinstance(obj, dict) else {}
+            end = s.rfind("}")
+            if end < 0:
+                return {}
+            # Scan backwards for a '{' that yields a valid JSON dict.
+            for i in range(end, -1, -1):
+                if s[i] != "{":
+                    continue
+                cand = s[i : end + 1].strip()
+                try:
+                    obj = json.loads(cand)
+                    if isinstance(obj, dict):
+                        return obj
+                except Exception:
+                    continue
         except Exception:
             return {}
         return {}
@@ -903,10 +928,11 @@ def _render_solve_prompts(
     stage_name: str,
     question_for_model: str,
     n: int,
-) -> tuple[str, List[str]]:
+) -> tuple[str, str]:
     """
-    Render the exact (system, user) prompts that will be fed to the model for solve-like calls.
-    This mirrors llm_client.py behavior (including templates, think-tag injection, and sample index suffix).
+    Render the (system, base_user) prompts used for solve-like calls.
+    Note: actual per-sample requests will append a sample suffix (e.g. '采样编号=i'),
+    but for logging we only keep the base user prompt once.
     """
     kw = ""
     try:
@@ -964,10 +990,8 @@ def _render_solve_prompts(
             tag = "/" + tag
         base_user = f"{tag}\n{base_user}"
 
-    users: List[str] = []
-    for i in range(int(n)):
-        users.append(f"{base_user}\n采样编号={i}")
-    return system, users
+    _ = n  # keep signature stable; sampling count doesn't change the base prompt
+    return system, base_user
 
 
 def _append_stage_infer_row(
@@ -977,7 +1001,7 @@ def _append_stage_infer_row(
     row: Dict[str, Any],
     model_input: str,
     model_prompt_system: str,
-    model_prompt_users: List[str],
+    model_prompt_user: str,
     raw_solutions: List[str],
     extracted_answers: List[str],
     n: int,
@@ -998,7 +1022,7 @@ def _append_stage_infer_row(
             "gold": row.get("answer"),
             "model_input": model_input,
             "model_prompt_system": str(model_prompt_system or ""),
-            "model_prompt_users": [str(x) for x in (model_prompt_users or [])][:n],
+            "model_prompt_user": str(model_prompt_user or ""),
             "raw_model_outputs": [str(x) for x in raw_solutions][:n],
             "extracted_answers": [str(x) for x in extracted_answers][:n],
             "min_votes_to_accept": int(min_votes_to_accept),
@@ -1301,7 +1325,7 @@ def mode_stage1_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
                 stats=s1_solve_stats,
             )
             n1 = int(llm.stage_params("stage1_solve").n)
-            sys_p, user_ps = _render_solve_prompts(llm=llm, stage_name="stage1_solve", question_for_model=model_q, n=n1)
+            sys_p, user_p = _render_solve_prompts(llm=llm, stage_name="stage1_solve", question_for_model=model_q, n=n1)
             extracted = _llm_extract_answers_batch(
                 llm=llm,
                 uuid=uuid,
@@ -1324,7 +1348,7 @@ def mode_stage1_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
                     "gold": gold,
                     "model_input": model_q,
                     "model_prompt_system": str(sys_p or ""),
-                    "model_prompt_users": [str(x) for x in (user_ps or [])][:n1],
+                    "model_prompt_user": str(user_p or ""),
                     "raw_model_outputs": [str(x) for x in raw_solutions][:n1],
                     "extracted_answers": [str(x) for x in extracted][:n1],
                     "min_votes_to_accept": int(min_votes_to_accept),
@@ -1507,7 +1531,9 @@ def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                         "vote_majority": majority_answer_json.get("majority"),
                         "vote_majority_count": int(majority_answer_json.get("majority_count", 0)),
                         "vote_counts": (majority_answer_json.get("counts") if isinstance(majority_answer_json.get("counts"), dict) else {}),
-                        "vote_raw_output": str(vote1.get("raw_output") or ""),
+                        "vote_raw_output": str(vote_raw_output or ""),
+                        "vote_model_input": str(vote_model_input or ""),
+                        "vote_candidates": [str(x or "") for x in (vote_candidates or [])],
                         **sel1,
                         "next_stage": next_stage,
                         "paths": paths,
@@ -1614,6 +1640,8 @@ def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                         "vote_majority_count": int(majority_answer_json.get("majority_count", 0)),
                         "vote_counts": (majority_answer_json.get("counts") if isinstance(majority_answer_json.get("counts"), dict) else {}),
                         "vote_raw_output": str(vote0.get("raw_output") or ""),
+                        "vote_model_input": str(vote0.get("model_input") or ""),
+                        "vote_candidates": [str(x or "") for x in extracted_answers],
                         **sel1,
                         "next_stage": next_stage,
                         "paths": paths,
@@ -1898,7 +1926,7 @@ def mode_stage2_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
             )
             n2 = int(llm.stage_params("stage2_solve").n)
             s2_extract_stats: Dict[str, int] = {}
-            sys_p, user_ps = _render_solve_prompts(llm=llm, stage_name="stage2_solve", question_for_model=model_q, n=n2)
+            sys_p, user_p = _render_solve_prompts(llm=llm, stage_name="stage2_solve", question_for_model=model_q, n=n2)
             extracted = _llm_extract_answers_batch(
                 llm=llm,
                 uuid=uuid,
@@ -1915,7 +1943,7 @@ def mode_stage2_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
                 row=r,
                 model_input=model_q,
                 model_prompt_system=sys_p,
-                model_prompt_users=user_ps,
+                model_prompt_user=user_p,
                 raw_solutions=[str(x) for x in raw_solutions],
                 extracted_answers=extracted,
                 n=n2,
@@ -2253,7 +2281,7 @@ def mode_stage3_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
             )
             n3 = int(llm.stage_params("stage3_solve").n)
             s3_extract_stats: Dict[str, int] = {}
-            sys_p, user_ps = _render_solve_prompts(llm=llm, stage_name="stage3_solve", question_for_model=model_q, n=n3)
+            sys_p, user_p = _render_solve_prompts(llm=llm, stage_name="stage3_solve", question_for_model=model_q, n=n3)
             extracted = _llm_extract_answers_batch(
                 llm=llm,
                 uuid=uuid,
@@ -2270,7 +2298,7 @@ def mode_stage3_infer(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes
                 row=r,
                 model_input=model_q,
                 model_prompt_system=sys_p,
-                model_prompt_users=user_ps,
+                model_prompt_user=user_p,
                 raw_solutions=[str(x) for x in raw_solutions],
                 extracted_answers=extracted,
                 n=n3,

@@ -86,12 +86,12 @@
     "vllm_stop_cmd": "pkill -f vllm.entrypoints.openai.api_server || true",
     "purge_conn_errors_on_start": true,
     "compact_outputs": true,
-    "answer_extract_keywords": ["FINAL:"],
+    "answer_extract_keywords": ["因此最终答案是:"],
     "prompts": {
       "__comment__": "All prompts are optional overrides; if omitted, built-in defaults are used.",
-      "vote_majority": "你是“答案归一化 + 多数投票评估器”，禁止解题。\\n禁止输出 <think> 或任何推理过程。\\n你的输出必须是 **严格 JSON**（不要代码块，不要解释，不要额外文本）。\\n\\n任务：\\n1) （可选）把同义/等价的候选答案归一化为相同字符串；不确定可输出空字符串 \\\"\\\"。\\n2) 基于归一化后的答案做多数投票（空字符串不参与投票），并给出 counts。\\n   - 平票规则：若最高票数并列，选择在列表中最早出现的那个。\\n\\n输出 JSON schema（必须遵守）：\\n{\\\"normalized\\\": [\\\"...\\\"], \\\"majority\\\": \\\"...\\\", \\\"majority_count\\\": 0, \\\"counts\\\": {\\\"...\\\": 0}}\\n\\n示例（仅供参考，勿照抄内容）：\\n[候选答案]\\n1. B\\n2. B\\n3. D\\n\\n输出：\\n{\\\"normalized\\\":[\\\"B\\\",\\\"B\\\",\\\"D\\\"],\\\"majority\\\":\\\"B\\\",\\\"majority_count\\\":2,\\\"counts\\\":{\\\"B\\\":2,\\\"D\\\":1}}\\n\\n[题目]\\n$question\\n\\n[选项映射(如有)]\\n$choice_block\\n\\n[候选答案]\\n$candidates\\n",
-      "solve_system": "你是一个数学解题助手。Stage=$stage_name。\\n最后一行必须输出最终答案，且格式必须严格为：$answer_keyword <答案>\\n如果题目是选择题：<答案> 只能是单个大写字母 A/B/C/D。\\n如果题目不是选择题：<答案> 为最终数值/表达式。",
-      "solve_user": "题目：\\n$question\\n\\n要求：你可以写推理过程，但最后一行必须是 $answer_keyword <答案>（严格格式）。",
+      "majority_vote": "你是“多数投票统计器”。禁止解题/复算/推导。\\n你只能输出一个 JSON 对象：必须以 { 开始，以 } 结束；不得输出任何其它文本、Markdown、代码块或 <think>。\\n\\n任务：\\n对同一题目的 candidates（字符串列表）做等价归并并投票，忽略空字符串 \\\"\\\"。\\n- majority：输出“最高票组的代表字符串”\\n- majority_count：最高票组的票数\\n- normalized：输出一个数组，长度=候选数；normalized[i] 必须是 candidates 中某条原始字符串（允许从同组中任选一条作为代表），禁止改写字符串。\\n- 平票：最高票并列时，选择“在 candidates 中最早出现的那个组”。\\n\\n等价归并允许的操作（仅限这些；不要做题目特定推导）：\\n1) 轻量清洗（不改变数学含义）：去首尾空白；压缩连续空白；去除外层包装 $...$、\\\\(...\\\\)、\\\\[...\\\\]、\\\\boxed{...}、\\\\left/\\\\right、\\\\displaystyle、以及明显的尾部残留符号（如孤立的 $、$$、多余的右括号/右花括号）。\\n2) 选择题映射：若题干中存在 A/B/C/D/... + 选项内容 的明确映射，则：字母与其选项内容视为等价；若同组内同时出现“字母”和“内容”，代表优先选字母（必须来自 candidates 原文）。\\n3) 结构化对象：矩阵/向量/多结果，只有当结构一致且逐项等价才可同组。\\n4) 多答案：只有当子答案数量一致且对应位置等价才同组；不允许自动排序。\\n\\n失败回退（必须遵守）：若你不确定如何归并或无法判断等价，则不要归并：把每条 candidates[i] 视为独立答案，normalized[i]=candidates[i]，再按出现次数投票。\\n\\n输出 schema（必须严格符合）：\\n{\\\"normalized\\\":[\\\"...\\\"],\\\"majority\\\":\\\"...\\\",\\\"majority_count\\\":0}",
+      "solve_system": "你是一个数学解题助手。Stage=$stage_name。\\n 你需要写推理过程，最后一行输出答案，答案需简洁避免重复输出、符合语义且必须完整，这行答案的格式必须严格为：$answer_keyword <答案>",
+      "solve_user": "题目：\\n$question\\n\\n 下面请按要求写下你的推理和答案。",
       "raw_prompt_eval_system": ""
     },
     "think_tag_default": "",
