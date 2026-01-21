@@ -199,6 +199,13 @@ class LLMRouter:
         except Exception:
             return int(default)
 
+    def option_any(self, name: str, default: Any) -> Any:
+        """
+        Return the raw option value as-is (supports list/dict from JSON config).
+        """
+        v = self._options.get(name)
+        return default if v is None else v
+
     def override_options(self, updates: Dict[str, Any]) -> None:
         """
         Override options at runtime (e.g., CLI overrides).
@@ -333,6 +340,46 @@ class LLMRouter:
                     return v2
         return self.option_str("think_tag_default", "")
 
+    def answer_keyword_for_stage(self, stage_name: str) -> str:
+        """
+        Return the configured answer delimiter keyword for solve prompts.
+        Source: options.answer_extract_keywords
+          - string: "FINAL:"
+          - list: ["FINAL:"]
+          - dict: { "default": ["FINAL:"], "stage3_solve": ["FINAL:"] }
+        We always take the first keyword as the generation delimiter.
+        """
+        default = ["FINAL:"]
+        raw = self.option_any("answer_extract_keywords", default)
+        key = (stage_name or "").strip()
+        stage_key_lower = key.lower()
+        if isinstance(raw, dict):
+            v = raw.get(stage_key_lower)
+            if v is None:
+                v = raw.get(key)
+            if v is None:
+                v = raw.get("default")
+            raw = v if v is not None else default
+        if isinstance(raw, str):
+            s = raw.strip()
+            return s if s else "FINAL:"
+        if isinstance(raw, list):
+            for x in raw:
+                s = str(x).strip()
+                if s:
+                    return s
+        return "FINAL:"
+
+    def prompt_text(self, name: str) -> str:
+        """
+        Fetch a prompt text from options.prompts.<name> if present, else empty string.
+        """
+        obj = self.option_any("prompts", {})
+        if isinstance(obj, dict):
+            v = obj.get(name)
+            return v if isinstance(v, str) else ""
+        return ""
+
     def _pick_client(self, stage_name: str) -> LLMClient:
         key = (stage_name or "").strip()
         model_name = self._routes.get(key) or self._routes.get("default") or ""
@@ -364,6 +411,10 @@ class LLMRouter:
     ):
         p = self.stage_params(stage_name)
         client = self._pick_client(stage_name)
+        answer_keyword = self.answer_keyword_for_stage(stage_name)
+        solve_system_tmpl = self.prompt_text("solve_system")
+        solve_user_tmpl = self.prompt_text("solve_user")
+        raw_prompt_eval_system_tmpl = self.prompt_text("raw_prompt_eval_system")
         return client.generate_n(
             stage_name=stage_name,
             question=question,
@@ -375,6 +426,10 @@ class LLMRouter:
             stats=stats,
             finish_early=self.option_bool("finish_early", True) if finish_early is None else bool(finish_early),
             think_tag=self.think_tag_for_stage(stage_name) if think_tag is None else str(think_tag),
+            answer_keyword=answer_keyword,
+            solve_system_template=solve_system_tmpl,
+            solve_user_template=solve_user_tmpl,
+            raw_prompt_eval_system_template=raw_prompt_eval_system_tmpl,
             max_workers=self.option_int("generate_n_max_workers", 8) if max_workers is None else int(max_workers),
             debug_print_prompts=self.option_bool("debug_print_prompts", False)
             if debug_print_prompts is None

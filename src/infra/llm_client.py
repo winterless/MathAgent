@@ -550,6 +550,10 @@ class LLMClient:
         stats: Optional[Dict[str, int]] = None,
         finish_early: bool = True,
         think_tag: str = "",
+        answer_keyword: str = "FINAL:",
+        solve_system_template: str = "",
+        solve_user_template: str = "",
+        raw_prompt_eval_system_template: str = "",
         max_workers: int = 1,
         debug_print_prompts: bool = False,
         debug_print_prompts_max_chars: int = 4000,
@@ -601,7 +605,7 @@ class LLMClient:
         if mode in ("raw_prompt", "raw_prompt_eval"):
             system = ""
             if mode == "raw_prompt_eval":
-                system = (
+                system = raw_prompt_eval_system_template.strip() if raw_prompt_eval_system_template.strip() else (
                     "你是一个**判断答案与标准答案一致**的专家。\n"
                     "你只做一致性判断，严禁解题、严禁复算、严禁推导题目。\n"
                     "注意：你拿到的解答数量以用户输入中的 [N]=... 为准；这些解答已经是“抽取后的答案文本”，你只能用它们来比对。\n"
@@ -645,28 +649,36 @@ class LLMClient:
             base_user = question.strip()
         else:
             if mode == "boxed_solve":
-                raise ValueError("prompt_mode='boxed_solve' has been removed; use prompt_mode='problem' (final answer as the last line: 'FINAL: <答案>').")
-            system = (
+                raise ValueError(
+                    "prompt_mode='boxed_solve' has been removed; use prompt_mode='problem' "
+                    "(final answer as the last line: '<answer_keyword> <答案>')."
+                )
+            kw = (answer_keyword or "FINAL:").strip() or "FINAL:"
+            from string import Template
+
+            default_system = (
                 f"你是一个数学解题助手。Stage={stage_name}。\n"
-                "最后一行必须输出最终答案，且格式必须严格为：FINAL: <答案>\n"
+                f"最后一行必须输出最终答案，且格式必须严格为：{kw} <答案>\n"
                 "如果题目是选择题：<答案> 只能是单个大写字母 A/B/C/D。\n"
                 "如果题目不是选择题：<答案> 为最终数值/表达式。"
             )
+            system_t = solve_system_template.strip() if solve_system_template.strip() else default_system
+            system = Template(system_t).safe_substitute(stage_name=str(stage_name), answer_keyword=str(kw))
             if finish_early:
                 system += (
                     "\n"
                     "如果你感觉推理会很长、或可能来不及写完，请立刻停止推理，"
-                    "直接在最后一行输出 FINAL: <你认为最可能的答案>（选择题在 A/B/C/D 中猜一个）。"
+                    f"直接在最后一行输出 {kw} <你认为最可能的答案>（选择题在 A/B/C/D 中猜一个）。"
                 )
-            base_user = (
-                f"题目：\n{question}\n\n"
-                "要求：你可以写推理过程，但最后一行必须是 FINAL: <答案>（严格格式）。"
-            )
+            default_user = f"题目：\n{question}\n\n要求：你可以写推理过程，但最后一行必须是 {kw} <答案>（严格格式）。"
+            user_t = solve_user_template.strip() if solve_user_template.strip() else default_user
+            base_user = Template(user_t).safe_substitute(question=str(question), answer_keyword=str(kw))
 
         # Optional Qwen-style mode tag injection (/think, /no_think, etc.)
-        # By default we only inject for solve-like modes, not for eval/judge prompts.
+        # We avoid injecting for raw_prompt_eval (judge) to keep strict formatting stable.
+        # raw_prompt is currently used for voting prompts, where /no_think is helpful.
         tag = (think_tag or "").strip()
-        if tag and mode not in ("raw_prompt", "raw_prompt_eval"):
+        if tag and mode not in ("raw_prompt_eval",):
             if not tag.startswith("/"):
                 tag = "/" + tag
             base_user = f"{tag}\n{base_user}"

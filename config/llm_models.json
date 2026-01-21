@@ -59,14 +59,14 @@
     "stage3_judge": { "n": 1, "temperature": 0, "max_tokens": 16384 }
   },
   "thresholds": {
-    "min_votes_to_accept": 5
+    "min_votes_to_accept": 3
   },
   "options": {
     "finish_early": false,
     "debug_print_prompts": false,
-    "debug_print_prompts_max_chars": 4000,
+    "debug_print_prompts_max_chars": 16384,
     "debug_print_outputs": true,
-    "debug_print_outputs_max_chars": 2000,
+    "debug_print_outputs_max_chars": 16384,
     "debug_stream_outputs": false,
     "generate_n_max_workers": 2,
     "__comment_vllm_autostart": "Optional: auto-start vLLM and reuse this command on connection-refused recovery (no external script needed).",
@@ -86,6 +86,14 @@
     "vllm_stop_cmd": "pkill -f vllm.entrypoints.openai.api_server || true",
     "purge_conn_errors_on_start": true,
     "compact_outputs": true,
+    "answer_extract_keywords": ["FINAL:"],
+    "prompts": {
+      "__comment__": "All prompts are optional overrides; if omitted, built-in defaults are used.",
+      "vote_majority": "你是“答案归一化 + 多数投票评估器”，禁止解题。\\n禁止输出 <think> 或任何推理过程。\\n你的输出必须是 **严格 JSON**（不要代码块，不要解释，不要额外文本）。\\n\\n任务：\\n1) （可选）把同义/等价的候选答案归一化为相同字符串；不确定可输出空字符串 \\\"\\\"。\\n2) 基于归一化后的答案做多数投票（空字符串不参与投票），并给出 counts。\\n   - 平票规则：若最高票数并列，选择在列表中最早出现的那个。\\n\\n输出 JSON schema（必须遵守）：\\n{\\\"normalized\\\": [\\\"...\\\"], \\\"majority\\\": \\\"...\\\", \\\"majority_count\\\": 0, \\\"counts\\\": {\\\"...\\\": 0}}\\n\\n示例（仅供参考，勿照抄内容）：\\n[候选答案]\\n1. B\\n2. B\\n3. D\\n\\n输出：\\n{\\\"normalized\\\":[\\\"B\\\",\\\"B\\\",\\\"D\\\"],\\\"majority\\\":\\\"B\\\",\\\"majority_count\\\":2,\\\"counts\\\":{\\\"B\\\":2,\\\"D\\\":1}}\\n\\n[题目]\\n$question\\n\\n[选项映射(如有)]\\n$choice_block\\n\\n[候选答案]\\n$candidates\\n",
+      "solve_system": "你是一个数学解题助手。Stage=$stage_name。\\n最后一行必须输出最终答案，且格式必须严格为：$answer_keyword <答案>\\n如果题目是选择题：<答案> 只能是单个大写字母 A/B/C/D。\\n如果题目不是选择题：<答案> 为最终数值/表达式。",
+      "solve_user": "题目：\\n$question\\n\\n要求：你可以写推理过程，但最后一行必须是 $answer_keyword <答案>（严格格式）。",
+      "raw_prompt_eval_system": ""
+    },
     "think_tag_default": "",
     "think_tag_by_profile": {
       "base": "",
@@ -104,10 +112,13 @@
     "stage1_solve": "think_fast",
     "stage1_eval": "think_fast",
     "stage1_judge": "think_fast",
+    "stage1_vote": "think_fast",
     "stage2_solve": "think_fast",
     "stage2_judge": "think_fast",
+    "stage2_vote": "think_fast",
     "stage3_solve": "think_slow",
-    "stage3_judge": "think_fast"
+    "stage3_judge": "think_fast",
+    "stage3_vote": "think_fast"
   }
 }
 
