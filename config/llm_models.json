@@ -48,27 +48,46 @@
       "retry_jitter_s": 0.2
     }
   },
+  "routes": {
+    "default": "base",
+    "stage1_solve": "think_fast",
+    "stage1_eval": "think_fast",
+    "stage2_solve": "think_fast",
+    "stage2_eval": "think_fast",
+    "stage3_solve": "think_slow",
+    "stage3_eval": "think_fast"
+  },
   "stage_params": {
     "default": { "n": 1, "temperature": 0.8, "max_tokens": 16384 },
     "stage1_solve": { "n": 4, "temperature": 2, "max_tokens": 16384 },
     "stage1_eval":  { "n": 1, "temperature": 0, "max_tokens": 16384 },
-    "stage1_judge": { "n": 1, "temperature": 0, "max_tokens": 16384 },
     "stage2_solve": { "n": 4, "temperature": 2, "max_tokens": 16384 },
-    "stage2_judge": { "n": 1, "temperature": 0, "max_tokens": 16384 },
+    "stage2_eval":  { "n": 1, "temperature": 0, "max_tokens": 16384 },
     "stage3_solve": { "n": 4, "temperature": 2, "max_tokens": 16384 },
-    "stage3_judge": { "n": 1, "temperature": 0, "max_tokens": 16384 }
+    "stage3_eval":  { "n": 1, "temperature": 0, "max_tokens": 16384 }
   },
   "thresholds": {
     "min_votes_to_accept": 3
   },
   "options": {
-    "finish_early": false,
+    "__comment_debug": "Debug / logging",
     "debug_print_prompts": false,
     "debug_print_prompts_max_chars": 16384,
     "debug_print_outputs": true,
     "debug_print_outputs_max_chars": 16384,
     "debug_stream_outputs": false,
     "generate_n_max_workers": 2,
+
+    "__comment_pipeline": "Pipeline behavior",
+    "finish_early": false,
+    "purge_conn_errors_on_start": true,
+    "compact_outputs": true,
+
+    "__comment_answer_extract": "Answer extraction (non-LLM)",
+    "answer_extract_keywords": ["因此最终答案是:"],
+    "answer_extract_take": "tail",
+
+    "__comment_prompts": "Prompt template overrides",
     "__comment_vllm_autostart": "Optional: auto-start vLLM and reuse this command on connection-refused recovery (no external script needed).",
     "vllm_autostart": true,
     "vllm_model_path": "/home/unlimitediw/workspace/TYDeepResearch/AgenticRLModelTraining/model/Qwen3-8B",
@@ -84,9 +103,6 @@
     "vllm_restart_cooldown_s": 30,
     "vllm_shutdown_on_exit": true,
     "vllm_stop_cmd": "pkill -f vllm.entrypoints.openai.api_server || true",
-    "purge_conn_errors_on_start": true,
-    "compact_outputs": true,
-    "answer_extract_keywords": ["因此最终答案是:"],
     "prompts": {
       "__comment__": "All prompts are optional overrides; if omitted, built-in defaults are used.",
       "majority_vote": "你是“多数投票统计器”。禁止解题/复算/推导。\\n你只能输出一个 JSON 对象：必须以 { 开始，以 } 结束；不得输出任何其它文本、Markdown、代码块或 <think>。\\n\\n任务：\\n对同一题目的 candidates（字符串列表）做等价归并并投票，忽略空字符串 \\\"\\\"。\\n- majority：输出“最高票组的代表字符串”\\n- majority_count：最高票组的票数\\n- normalized：输出一个数组，长度=候选数；normalized[i] 必须是 candidates 中某条原始字符串（允许从同组中任选一条作为代表），禁止改写字符串。\\n- 平票：最高票并列时，选择“在 candidates 中最早出现的那个组”。\\n\\n等价归并允许的操作（仅限这些；不要做题目特定推导）：\\n1) 轻量清洗（不改变数学含义）：去首尾空白；压缩连续空白；去除外层包装 $...$、\\\\(...\\\\)、\\\\[...\\\\]、\\\\boxed{...}、\\\\left/\\\\right、\\\\displaystyle、以及明显的尾部残留符号（如孤立的 $、$$、多余的右括号/右花括号）。\\n2) 选择题映射：若题干中存在 A/B/C/D/... + 选项内容 的明确映射，则：字母与其选项内容视为等价；若同组内同时出现“字母”和“内容”，代表优先选字母（必须来自 candidates 原文）。\\n3) 结构化对象：矩阵/向量/多结果，只有当结构一致且逐项等价才可同组。\\n4) 多答案：只有当子答案数量一致且对应位置等价才同组；不允许自动排序。\\n\\n失败回退（必须遵守）：若你不确定如何归并或无法判断等价，则不要归并：把每条 candidates[i] 视为独立答案，normalized[i]=candidates[i]，再按出现次数投票。\\n\\n输出 schema（必须严格符合）：\\n{\\\"normalized\\\":[\\\"...\\\"],\\\"majority\\\":\\\"...\\\",\\\"majority_count\\\":0}",
@@ -94,6 +110,7 @@
       "solve_user": "题目：\\n$question\\n\\n 下面请按要求写下你的推理和答案。",
       "raw_prompt_eval_system": ""
     },
+    "__comment_think_tag": "Model think-tag injection",
     "think_tag_default": "",
     "think_tag_by_profile": {
       "base": "",
@@ -106,19 +123,6 @@
     "vllm_autostart_use_restart_cmd": true,
     "vllm_restart_delay_s": 3,
     "vllm_autostart_force_reset_and_kill": true
-  },
-  "routes": {
-    "default": "base",
-    "stage1_solve": "think_fast",
-    "stage1_eval": "think_fast",
-    "stage1_judge": "think_fast",
-    "stage1_vote": "think_fast",
-    "stage2_solve": "think_fast",
-    "stage2_judge": "think_fast",
-    "stage2_vote": "think_fast",
-    "stage3_solve": "think_slow",
-    "stage3_judge": "think_fast",
-    "stage3_vote": "think_fast"
   }
 }
 

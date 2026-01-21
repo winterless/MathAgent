@@ -27,6 +27,7 @@ from core.stages import (
     extract_choice_map,
     extract_final_answer,
     normalize_for_model,
+    rule_equivalent,
     standardize_choice_answer,
 )
 from core.voting import majority_vote
@@ -682,6 +683,13 @@ def _select_answer(*, gold: str, majority: Dict[str, Any], min_votes_to_accept: 
     return {"final_answer": "", "final_source": "no_majority", "final_vote_count": maj_cnt}
 
 
+def _safe_rule_equivalent(*, pred: str, gold: str, choice_map: Dict[str, str]) -> bool | None:
+    try:
+        return rule_equivalent(str(pred or ""), str(gold or ""), choice_map=choice_map)
+    except Exception:
+        return None
+
+
 def _llm_extract_answers_batch(
     *,
     llm: LLMRouter,
@@ -838,8 +846,11 @@ def _llm_vote_majority_from_extracted(
         f"[候选答案]\n{cand_payload}\n"
     ).strip()
 
+    # Scheme-A unification: voting is an internal step of *_eval.
+    # Route/params/think_tag should follow stage*_eval instead of requiring stage*_vote.
+    vote_stage_name = f"{stage}_eval"
     resp = llm.generate_n(
-        stage_name=f"{stage}_vote",
+        stage_name=vote_stage_name,
         question=prompt,
         prompt_mode="raw_prompt",
         n=1,
@@ -851,7 +862,6 @@ def _llm_vote_majority_from_extracted(
     )[0]
     txt = (resp or "").strip()
     # Record the actual user prompt we feed to the model (including think-tag injection).
-    vote_stage_name = f"{stage}_vote"
     vote_tag = ""
     try:
         vote_tag = str(llm.think_tag_for_stage(vote_stage_name) or "").strip()
@@ -1453,6 +1463,13 @@ def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
 
                 q_raw = r.get("question") if isinstance(r.get("question"), str) else ""
                 gold = (r.get("answer") or "").strip() if isinstance(r.get("answer"), str) else ""
+                # Normalize question for downstream utilities (e.g. choice-map extraction).
+                # Some branches below previously didn't define `model_q`, causing UnboundLocalError.
+                model_q = (
+                    r.get("model_input")
+                    if isinstance(r.get("model_input"), str)
+                    else append_choice_map_if_any(normalize_for_model(q_raw))
+                )
 
                 # Preferred (output-mode): parse boxed ok/bad counts from the embedded output wrapper.
                 # stage1_output.stage1.jsonl is expected to contain a judge-style output:
@@ -1488,7 +1505,6 @@ def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                 else:
                     # Fallback (legacy): if the artifact contains extracted_answers, derive routing from vote strength.
                     extracted_answers = r.get("extracted_answers") if isinstance(r.get("extracted_answers"), list) else []
-                    model_q = r.get("model_input") if isinstance(r.get("model_input"), str) else append_choice_map_if_any(normalize_for_model(q_raw))
                     choice_map = extract_choice_map(model_q)
                     vote1 = _llm_vote_majority_from_extracted(
                         llm=llm,
@@ -1520,6 +1536,18 @@ def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                 paths = {"output": stage1_output_path}
                 if os.path.exists(stage1_infer_path):
                     paths["infer"] = stage1_infer_path
+                # Correctness: best-effort rule-based check (may be None when unsure).
+                choice_map_for_eval = extract_choice_map(model_q) if isinstance(model_q, str) else {}
+                vote_is_correct = _safe_rule_equivalent(
+                    pred=str(majority_answer_json.get("majority") or ""),
+                    gold=str(gold or ""),
+                    choice_map=choice_map_for_eval,
+                )
+                final_is_correct = (
+                    _safe_rule_equivalent(pred=str(sel1.get("final_answer") or ""), gold=str(gold or ""), choice_map=choice_map_for_eval)
+                    if str(sel1.get("final_answer") or "").strip()
+                    else None
+                )
                 append_jsonl_line(
                     stage1_status_path,
                     {
@@ -1534,6 +1562,8 @@ def mode_stage1_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                         "vote_raw_output": str(vote_raw_output or ""),
                         "vote_model_input": str(vote_model_input or ""),
                         "vote_candidates": [str(x or "") for x in (vote_candidates or [])],
+                        "vote_is_correct": vote_is_correct,
+                        "final_is_correct": final_is_correct,
                         **sel1,
                         "next_stage": next_stage,
                         "paths": paths,
@@ -2060,6 +2090,16 @@ def mode_stage2_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
             sel2 = _select_answer(gold=gold, majority=stage2_majority_answer, min_votes_to_accept=min_votes_to_accept)
             final_answer2 = str(sel2.get("final_answer") or "").strip()
             maj_cnt = int(stage2_majority_answer.get("majority_count", 0) or 0)
+            vote_is_correct = _safe_rule_equivalent(
+                pred=str(stage2_majority_answer.get("majority") or ""),
+                gold=str(gold or ""),
+                choice_map=choice_map,
+            )
+            final_is_correct = (
+                _safe_rule_equivalent(pred=str(sel2.get("final_answer") or ""), gold=str(gold or ""), choice_map=choice_map)
+                if str(sel2.get("final_answer") or "").strip()
+                else None
+            )
 
             entry: Dict[str, Any] = {
                 "uuid": uuid,
@@ -2117,6 +2157,8 @@ def mode_stage2_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                 "vote_raw_output": str(vote2.get("raw_output") or ""),
                 "vote_model_input": str(vote_model_input or ""),
                 "vote_candidates": [str(x or "") for x in extracted_trim],
+                    "vote_is_correct": vote_is_correct,
+                    "final_is_correct": final_is_correct,
                 **_select_answer(gold=gold, majority=stage2_majority_answer, min_votes_to_accept=min_votes_to_accept),
                 "next_stage": next_stage,
                 "paths": paths,
@@ -2415,6 +2457,16 @@ def mode_stage3_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
             sel3 = _select_answer(gold=gold, majority=stage3_majority_answer, min_votes_to_accept=min_votes_to_accept)
             final_answer3 = str(sel3.get("final_answer") or "").strip()
             maj_cnt = int(stage3_majority_answer.get("majority_count", 0) or 0)
+            vote_is_correct = _safe_rule_equivalent(
+                pred=str(stage3_majority_answer.get("majority") or ""),
+                gold=str(gold or ""),
+                choice_map=choice_map,
+            )
+            final_is_correct = (
+                _safe_rule_equivalent(pred=str(sel3.get("final_answer") or ""), gold=str(gold or ""), choice_map=choice_map)
+                if str(sel3.get("final_answer") or "").strip()
+                else None
+            )
 
             entry = {
                 "uuid": uuid,
@@ -2466,6 +2518,8 @@ def mode_stage3_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                     "vote_raw_output": str(vote3.get("raw_output") or ""),
                     "vote_model_input": str(vote_model_input or ""),
                     "vote_candidates": [str(x or "") for x in extracted_trim],
+                    "vote_is_correct": vote_is_correct,
+                    "final_is_correct": final_is_correct,
                     **sel3,
                     "next_stage": ("accepted" if sel3.get("final_source") == "majority" else "no_answer"),
                     "paths": paths,
