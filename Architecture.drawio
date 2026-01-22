@@ -1,0 +1,115 @@
+<mxfile host="65bd71144e">
+    <diagram id="mathagent-pipeline" name="MathAgent Pipeline" compressed="false">
+        <mxGraphModel dx="1045" dy="851" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2000" pageHeight="1200" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="envprep" value="env prepare" style="rounded=1;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="990" y="50" width="180" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="simplerunner" value="simple_runner" style="rounded=1;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="740" y="50" width="180" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="pipeline" value="run_pipeline.py" style="rounded=1;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="500" y="50" width="180" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="input" value="Input: datasets/input (*.jsonl)" style="shape=note;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="480" y="140" width="220" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="s1out" value="stage1_output.stage1.jsonl" style="shape=note;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="720" y="140" width="260" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="s1eval" value="stage1_eval" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="1020" y="145" width="160" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="s2input" value="stage2_input.stage2.jsonl" style="shape=note;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="720" y="230" width="260" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="s2infer" value="stage2_infer" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="1020" y="240" width="160" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="s2inferout" value="stage2_infer.stage2.jsonl" style="shape=note;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="1220" y="240" width="260" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="s2eval" value="stage2_eval" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="1020" y="340" width="160" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="s3input" value="stage3_input.stage3.jsonl" style="shape=note;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="720" y="430" width="260" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="s3infer" value="stage3_infer" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="1020" y="440" width="160" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="s3inferout" value="stage3_infer.stage3.jsonl" style="shape=note;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="1220" y="440" width="260" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="s3eval" value="stage3_eval" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="1020" y="540" width="160" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="result" value="Outputs: accepted_bank + result" style="shape=note;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="720" y="630" width="260" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="rebuild" value="result_rebuild" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="1020" y="640" width="160" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="e0" style="endArrow=block;html=1;" edge="1" parent="1" source="envprep" target="simplerunner">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e1" style="endArrow=block;html=1;" parent="1" source="simplerunner" target="pipeline" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e2" style="endArrow=block;html=1;" parent="1" source="pipeline" target="input" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e3" style="endArrow=block;html=1;" parent="1" source="input" target="s1out" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e4" style="endArrow=block;html=1;" parent="1" source="s1out" target="s1eval" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e5" style="endArrow=block;html=1;" parent="1" source="s1eval" target="s2input" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e6" style="endArrow=block;html=1;" parent="1" source="s2input" target="s2infer" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e7" style="endArrow=block;html=1;" parent="1" source="s2infer" target="s2inferout" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e8" style="endArrow=block;html=1;" edge="1" parent="1" source="s2inferout" target="s2eval">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e9" style="endArrow=block;html=1;" edge="1" parent="1" source="s2eval" target="s3input">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e10" style="endArrow=block;html=1;" edge="1" parent="1" source="s3input" target="s3infer">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e11" style="endArrow=block;html=1;" edge="1" parent="1" source="s3infer" target="s3inferout">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e12" style="endArrow=block;html=1;" edge="1" parent="1" source="s3inferout" target="s3eval">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e13" style="endArrow=block;html=1;" edge="1" parent="1" source="s3eval" target="result">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e14" style="endArrow=block;html=1;" edge="1" parent="1" source="result" target="rebuild">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="7" style="edgeStyle=none;html=1;entryX=0.5;entryY=1;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="3" target="input">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="3" value="stage1_infer" style="rounded=1;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="510" y="235" width="160" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="6" style="edgeStyle=none;html=1;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="5" target="3">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="5" value="Input: questions (*.jsonl)" style="shape=note;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="480" y="335" width="220" height="60" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>
