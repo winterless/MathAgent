@@ -1,5 +1,7 @@
 ## MathAgent Architecture (as-implemented)
 
+![IDEA](others/diagrams/IDEA.png)
+
 ![Architecture](others/diagrams/architecture.png)
 
 ### Pipeline 流程图（更新版）
@@ -17,12 +19,32 @@ flowchart TD
     G --> H[result_rebuild]
 ```
 
+### 顶层设计（泛化数据生成器 / Scenario-driven）
+
+`MathAgent_Idea.drawio` 对应的核心思想是：
+
+- **进入 MathAgent 的必须是标准数据**：外部的数据处理器（例如你说的 UDataset）负责把原始数据转换成标准 schema/wrapper。
+- **MathAgent 内部三段式**：
+  - **生产数据（Production）**：`infer` 产出 raw generations / rawdata（多轮采样/多候选）
+  - **评估数据（Eval）**：规则提取 +（可多输入的）eval + vote/一致性统计
+  - **结果构建（Result Build）**：融合 production+eval 产物与 build 规则，产出最终可入库数据
+- **“多轮投票”只是一个场景**：它通过配置文件描述“轮次/步骤顺序”，底座是通用的 scenario 执行器。
+
+当前落地方式：
+
+- **通用底座**：`src/generator/`（按 scenario 配置顺序执行一组 ops）
+- **多轮投票场景**：`config/scenarios/multiround_vote.json`
+- **模型/采样/阈值**：仍由 `config/llm_models.json` 描述（routes/stage_params/thresholds/options）
+
 ### 源码分层（真实目录）
 
 - **CLI / Orchestration**：`src/run_pipeline.py`
-  - 唯一入口，统一实现 **full** 与 **Route-A modular**（`stage1_infer/stage1_eval/stage2_infer/stage2_eval/stage3_infer/stage3_eval`）
+  - 唯一入口；既支持 **Route-A modular**（`stage1_infer/stage1_eval/stage2_infer/stage2_eval/stage3_infer/stage3_eval`），也支持 **scenario**（`--mode scenario --scenario-config ...`）
   - 负责工件落盘、断点续跑（done-set/status）、路由（是否进入下一阶段）
   - 启动时可进行 **connection-error 数据清理**（见“运行时稳定性”）
+- **Generator / Scenario runner（通用底座）**：`src/generator/`
+  - `scenario_runner.py`：按配置顺序执行步骤（底座不绑定“多轮投票”）
+  - `scenario_config.py`：scenario JSON schema（最小模板替换：`${RAW_INPUT}` / `${OUT_DIR}`）
 - **Core (Domain)**：`src/core/`
   - `stages.py`：输入归一化、选项映射、答案抽取（`FINAL:` / `\\boxed{}`）、规则等价判别、Stage1 boxed 统计解析
   - `prompt_assemble.py`：拼装 Stage1 evaluator `prompt`（sample.jsonl 风格）
@@ -33,6 +55,7 @@ flowchart TD
 - **Infra (LLM)**：`src/infra/`
   - `llm_router.py`：读取 `config/llm_models.json`（models/routes/stage_params/thresholds/options），并对外提供统一 `generate_n()`
   - `llm_client.py`：OpenAI-compatible HTTP 客户端（retry/backoff、debug 打印、可选 SSE stream），以及 **connection refused 恢复等待/可选重启**（env 控制）
+  - `llm_helper.py`：LLM connect/start/restart/healthcheck 的 helper（由 `options.vllm_*` 驱动）
 
 ### 配置中心：`config/llm_models.json`
 
@@ -46,6 +69,13 @@ flowchart TD
   - `think_tag_default / think_tag_by_stage / think_tag_by_profile`：向 user content 注入 tag（例如 `/think`、`/no_think`）
   - `debug_print_prompts / debug_print_outputs / debug_stream_outputs`：调试打印与可选流式输出（仅影响日志，不影响落盘结构）
   - `generate_n_max_workers`：`LLMClient.generate_n()` 内部并发上限（注意并发过高会放大 vLLM 负载峰值）
+
+### 场景配置：`config/scenarios/*.json`
+
+- **目的**：把“轮次/步骤顺序”从代码里抽出来，描述为配置；从而让“多轮投票”变成**可替换场景**。
+- **默认场景**：`config/scenarios/multiround_vote.json`
+  - `steps[]`：一个有序的 `op` 列表（如 `stage1_infer -> stage1_eval -> stage2_infer -> ... -> result_rebuild`）
+  - `input`：支持 `${RAW_INPUT}` 与 `${OUT_DIR}` 两个变量
 
 ### 工件（Artifacts）与断点续跑（Done Sets）
 

@@ -1,43 +1,13 @@
 """
-CLI entrypoint for MathAgent.
-
-Design note:
-- The legacy Route-A stage implementation lives in `src/generator/route_a_impl.py`.
-- This file intentionally stays thin (CLI/entry + orchestration).
-"""
-
-# from __future__ import annotations  # (already at top)
-
-from generator.route_a_impl import main
-
-
-if __name__ == "__main__":
-    main()
-    raise SystemExit(0)
-
-"""
-CLI entrypoint for MathAgent.
-
-Design note:
-- The legacy Route-A stage implementation lives in `src/generator/route_a_impl.py`.
-- This file intentionally stays thin (CLI/entry + generic orchestration).
-"""
-
-# from __future__ import annotations  # (already at top)
-
-from generator.route_a_impl import main
-
-
-if __name__ == "__main__":
-    main()
-
-"""
 MathAgent minimal pipeline (JSONL between stages).
 
-This is the **single entrypoint** for the project.
+This is the original pipeline implementation, moved from `src/run_pipeline.py`.
+
+`src/run_pipeline.py` is now a thin CLI wrapper; this module contains the
+legacy Route-A stage logic and helpers for backward compatibility.
 """
 
-# from __future__ import annotations  # (already at top)
+from __future__ import annotations
 
 import argparse
 import json
@@ -820,7 +790,8 @@ def _llm_vote_majority_from_extracted(
         "normalized": List[str] (aligned with extracted_answers),
         "majority": str,
         "majority_count": int,
-        "counts": Dict[str, int]
+        "counts": Dict[str, int],
+        "keep_indices": List[int]  # indices of candidates that belong to majority group (for result writing)
       }
     """
     answers = [str(x or "") for x in (extracted_answers or [])]
@@ -844,14 +815,15 @@ def _llm_vote_majority_from_extracted(
         "2) 基于归一化后的答案做多数投票（空字符串不参与投票），并给出 counts。\n"
         "   - 平票规则：若最高票数并列，选择在列表中最早出现的那个。\n\n"
         "输出 JSON schema（必须遵守）：\n"
-        "{\"normalized\": [\"...\"], \"majority\": \"...\", \"majority_count\": 0, \"counts\": {\"...\": 0}}\n\n"
+        "{\"normalized\": [\"...\"], \"majority\": \"...\", \"majority_count\": 0, \"counts\": {\"...\": 0}, \"keep\": [0,1,0]}\n"
+        "其中 keep 是一个 0/1 数组，长度必须等于 candidates 长度；keep[i]=1 表示 candidates[i] 属于最终多数答案组（将被写入 result）。\n\n"
         "示例（仅供参考，勿照抄内容）：\n"
         "[候选答案]\n"
         "1. B\n"
         "2. B\n"
         "3. D\n\n"
         "输出：\n"
-        "{\"normalized\":[\"B\",\"B\",\"D\"],\"majority\":\"B\",\"majority_count\":2,\"counts\":{\"B\":2,\"D\":1}}\n\n"
+        "{\"normalized\":[\"B\",\"B\",\"D\"],\"majority\":\"B\",\"majority_count\":2,\"counts\":{\"B\":2,\"D\":1},\"keep\":[1,1,0]}\n\n"
         "[题目]\n$question\n\n"
         "[选项映射(如有)]\n$choice_block\n\n"
         "[候选答案]\n$candidates\n"
@@ -949,6 +921,58 @@ def _llm_vote_majority_from_extracted(
         majority_count = int(obj.get("majority_count") or 0)
     except Exception:
         majority_count = 0
+
+    # Prefer explicit "keep" signals from the model for result writing.
+    keep_indices: List[int] = []
+    raw_keep = obj.get("keep")
+    raw_keep_indices = obj.get("keep_indices")
+    raw_majority_indices = obj.get("majority_indices")
+    raw_majority_answer_idxs = obj.get("majority_answer_idxs")
+    if isinstance(raw_keep, list) and len(raw_keep) == len(answers):
+        for i, v in enumerate(raw_keep):
+            try:
+                if bool(int(v)):
+                    keep_indices.append(int(i))
+            except Exception:
+                if bool(v):
+                    keep_indices.append(int(i))
+    elif isinstance(raw_keep_indices, list):
+        for v in raw_keep_indices:
+            try:
+                i = int(v)
+            except Exception:
+                continue
+            if 0 <= i < len(answers):
+                keep_indices.append(i)
+    elif isinstance(raw_majority_indices, list):
+        for v in raw_majority_indices:
+            try:
+                i = int(v)
+            except Exception:
+                continue
+            if 0 <= i < len(answers):
+                keep_indices.append(i)
+    elif isinstance(raw_majority_answer_idxs, list):
+        for v in raw_majority_answer_idxs:
+            try:
+                i = int(v)
+            except Exception:
+                continue
+            if 0 <= i < len(answers):
+                keep_indices.append(i)
+    # de-dup, keep order
+    if keep_indices:
+        seen = set()
+        keep_indices2: List[int] = []
+        for i in keep_indices:
+            if i in seen:
+                continue
+            seen.add(i)
+            keep_indices2.append(i)
+        keep_indices = keep_indices2
+        # If model provided indices, prefer it as authoritative majority_count for downstream routing/writing.
+        majority_count = int(len(keep_indices))
+
     counts_obj = obj.get("counts")
     counts: Dict[str, int] = {}
     if isinstance(counts_obj, dict):
@@ -962,6 +986,7 @@ def _llm_vote_majority_from_extracted(
         "majority": majority,
         "majority_count": int(majority_count),
         "counts": counts,
+        "keep_indices": keep_indices,
         # Store the raw LLM output for debugging/auditing in status files.
         "raw_output": txt,
         # Store the actual prompt fed to the model (user content).
@@ -1185,11 +1210,32 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int) -> None:
         question = row.get("question")
         if question is None:
             return []
-        # Prefer status-derived majority (authoritative in normal modular flow).
+        # Prefer status-derived keep-indices (authoritative; avoids fragile string matching).
         maj_ans = ""
         maj_cnt = 0
         threshold = int(min_votes_to_accept)
+        keep_indices: List[int] = []
         if isinstance(status_row, dict) and status_row:
+            raw_keep = status_row.get("vote_majority_answer_idxs")
+            if isinstance(raw_keep, list):
+                for v in raw_keep:
+                    try:
+                        i = int(v)
+                    except Exception:
+                        continue
+                    if 0 <= i < min(len(raws), len(extracted)):
+                        keep_indices.append(i)
+                # de-dup, keep order
+                if keep_indices:
+                    seen = set()
+                    keep2: List[int] = []
+                    for i in keep_indices:
+                        if i in seen:
+                            continue
+                        seen.add(i)
+                        keep2.append(i)
+                    keep_indices = keep2
+
             maj_ans = str(status_row.get("vote_majority") or "").strip()
             try:
                 maj_cnt = int(status_row.get("vote_majority_count") or 0)
@@ -1212,6 +1258,21 @@ def result_rebuild(*, out_dir: str, min_votes_to_accept: int) -> None:
             except Exception:
                 threshold = int(min_votes_to_accept)
             maj_cnt = int(v.majority_count or 0)
+
+        # If keep_indices exist, they define exactly which attempts should be written.
+        if keep_indices:
+            if int(len(keep_indices)) < int(threshold):
+                return []
+            results: List[Tuple[int, str]] = []
+            for idx in keep_indices:
+                try:
+                    raw = raws[idx]
+                    pred = extracted[idx]
+                except Exception:
+                    continue
+                text = _build_result_text(str(question), str(raw), str(pred))
+                results.append((idx, text))
+            return results
 
         if not maj_ans or int(maj_cnt) < int(threshold):
             return []
@@ -2136,6 +2197,7 @@ def mode_stage2_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                 "majority_count": int(vote2.get("majority_count") or 0),
                 "counts": (vote2.get("counts") if isinstance(vote2.get("counts"), dict) else {}),
             }
+            keep2 = vote2.get("keep_indices") if isinstance(vote2.get("keep_indices"), list) else []
             vote_model_input = str(vote2.get("model_input") or "")
             sel2 = _select_answer(gold=gold, majority=stage2_majority_answer, min_votes_to_accept=min_votes_to_accept)
             final_answer2 = str(sel2.get("final_answer") or "").strip()
@@ -2190,38 +2252,50 @@ def mode_stage2_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
             except Exception:
                 fv_i = 0
             next_stage = "stage3" if fv_i < int(min_votes_to_accept) else "accepted"
-        paths = {"infer": stage2_infer_path}
-        if not compact:
-            paths["archive"] = stage2_archive_path
-        append_jsonl_line(
-            stage2_status_path,
-            {
-                "uuid": uuid,
-                "stage": "stage2",
+            # Status must ALWAYS be written (compact_outputs should only affect archive/raw_generations).
+            paths = {"infer": stage2_infer_path}
+            if not compact:
+                paths["archive"] = stage2_archive_path
+            append_jsonl_line(
+                stage2_status_path,
+                {
+                    "uuid": uuid,
+                    "stage": "stage2",
                     "ok": int(maj_cnt),
                     "bad": int(max(0, int(n2) - maj_cnt)),
-                "min_votes_to_accept": int(min_votes_to_accept),
-                "vote_majority": stage2_majority_answer.get("majority"),
-                "vote_majority_count": int(stage2_majority_answer.get("majority_count", 0)),
-                "vote_counts": (stage2_majority_answer.get("counts") if isinstance(stage2_majority_answer.get("counts"), dict) else {}),
-                "vote_raw_output": str(vote2.get("raw_output") or ""),
-                "vote_model_input": str(vote_model_input or ""),
-                "vote_candidates": [str(x or "") for x in extracted_trim],
+                    "min_votes_to_accept": int(min_votes_to_accept),
+                    "vote_majority": stage2_majority_answer.get("majority"),
+                    "vote_majority_count": int(stage2_majority_answer.get("majority_count", 0)),
+                    "vote_counts": (
+                        stage2_majority_answer.get("counts")
+                        if isinstance(stage2_majority_answer.get("counts"), dict)
+                        else {}
+                    ),
+                    "vote_raw_output": str(vote2.get("raw_output") or ""),
+                    "vote_model_input": str(vote_model_input or ""),
+                    "vote_candidates": [str(x or "") for x in extracted_trim],
+                    "vote_majority_answer_idxs": [
+                        int(x) for x in keep2 if isinstance(x, int) or (isinstance(x, str) and str(x).isdigit())
+                    ],
                     "vote_is_correct": vote_is_correct,
                     "final_is_correct": final_is_correct,
-                **_select_answer(gold=gold, majority=stage2_majority_answer, min_votes_to_accept=min_votes_to_accept),
-                "next_stage": next_stage,
-                "paths": paths,
-            },
-        )
-
-        if next_stage == "stage3" and not compact:
-            append_jsonl_line(
-                stage3_input_path,
-                {
-                    **{k: r.get(k) for k in CANONICAL_KEYS},
+                    **_select_answer(
+                        gold=gold,
+                        majority=stage2_majority_answer,
+                        min_votes_to_accept=min_votes_to_accept,
+                    ),
+                    "next_stage": next_stage,
+                    "paths": paths,
                 },
             )
+
+            if next_stage == "stage3" and not compact:
+                append_jsonl_line(
+                    stage3_input_path,
+                    {
+                        **{k: r.get(k) for k in CANONICAL_KEYS},
+                    },
+                )
             dt = time.monotonic() - t0
             if prog is not None:
                 prog.tick(dt)
@@ -2503,6 +2577,7 @@ def mode_stage3_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                 "majority_count": int(vote3.get("majority_count") or 0),
                 "counts": (vote3.get("counts") if isinstance(vote3.get("counts"), dict) else {}),
             }
+            keep3 = vote3.get("keep_indices") if isinstance(vote3.get("keep_indices"), list) else []
             vote_model_input = str(vote3.get("model_input") or "")
             sel3 = _select_answer(gold=gold, majority=stage3_majority_answer, min_votes_to_accept=min_votes_to_accept)
             final_answer3 = str(sel3.get("final_answer") or "").strip()
@@ -2568,6 +2643,7 @@ def mode_stage3_eval(*, input_arg: str, out_dir: str, llm: LLMRouter, min_votes_
                     "vote_raw_output": str(vote3.get("raw_output") or ""),
                     "vote_model_input": str(vote_model_input or ""),
                     "vote_candidates": [str(x or "") for x in extracted_trim],
+                    "vote_majority_answer_idxs": [int(x) for x in keep3 if isinstance(x, int) or (isinstance(x, str) and str(x).isdigit())],
                     "vote_is_correct": vote_is_correct,
                     "final_is_correct": final_is_correct,
                     **sel3,
