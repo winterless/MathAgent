@@ -115,8 +115,8 @@ PYTHONPATH=src python3 src/run_pipeline.py \
 ```
 
 Rebuild rules:
-- Vote on `extracted_answers` and require `majority_count >= min_votes_to_accept`.
-- Emit one result per attempt whose extracted answer matches the voted answer.
+- Prefer using per-uuid status metadata (`vote_majority_answer_idxs`) to decide exactly which attempts
+  should be written to `result/*.result.stage_final.jsonl` (requires `majority_count >= min_votes_to_accept`).
 - Result schema: `{"uuid": ..., "text": "<question + reasoning + answer>"}`
 - To avoid collisions, each attempt appends its index to the uuid: `<uuid>-<attempt_idx>`
 - If `--input` is a parent directory that contains multiple run subdirectories
