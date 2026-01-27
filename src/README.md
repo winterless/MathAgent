@@ -1,55 +1,47 @@
-# Minimal Python pipeline v2 (infer/eval/result_rebuild)
+# Minimal Python pipeline v2
 
-## Input format
-`--input` can be either:
-- a JSONL file, or
-- a directory containing `*.jsonl` files (each file runs independently, using filename stem as output prefix)
+## What it does
+`src/run_pipeline.py` exposes **three ops**:
+- **`infer`**: produce `<out>/infer.jsonl`
+- **`eval`**: consume `<input>/infer.jsonl` and produce `<out>/status.jsonl`
+- **`result_rebuild`**: consume `<run_dir>/**/{infer.jsonl,status.jsonl}` and produce `<run_dir>/result/result.stage_final.jsonl`
 
-Each line must be a JSON object with at least one of:
+Stage is **not** a separate CLI argument. It is implied by the **output directory name** (e.g. `.../stage1`, `.../stage2`).
+Chaining stages is **data-driven**: downstream `infer` picks rows where upstream `status.jsonl` has `accepted=false`.
 
-- `prompt`: full instruction text (preferred), or
-- `question`: task text, or
-- `text`: task text
+## Input data format (raw dataset)
+When `--mode infer` consumes a raw dataset (`--input` is a JSONL file or a directory), each line must be a JSON object with at least one of:
+- `question`
+- `prompt`
+- `text`
 
-Example: `datasets/input/example_input.jsonl`
+Which field is used is controlled by `config/llm_models.json`:
+- `options.input.question_key_priority` (default `["question","prompt","text"]`)
+- `options.input.raw_input_glob` (when `--input` is a directory; default `"*.jsonl"`)
 
-## Run (real OpenAI-compatible API)
-### Use the model routing config (v2)
-
-Edit `config/llm_models.json` to describe your **three models** (e.g. 30B 快思考 / 30B 慢思考 / 基础模型),
-and how each pipeline stage routes to them.
-
-The CLI entrypoint `src/run_pipeline.py` provides only **three generic ops**:
-- `infer`
-- `eval`
-- `result_rebuild`
-
-There is **no `--stage` argument**. Stage is inferred from the stage directory name:
-`<run_dir>/<stage>/`.
-
-Directory layout:
-
-- `<run_dir>/stage1/input.jsonl`
-- `<run_dir>/stage1/infer.jsonl`
-- `<run_dir>/stage1/status.jsonl`
-- `<run_dir>/stage2/input.jsonl` (emitted by `eval` of stage1 when needed)
-- ...
-
-Example (stage1):
+## End-to-end reference (stage1 → stage3)
+All commands below go together as a single reference run:
 
 ```bash
-# Prepare stage1 input
-mkdir -p datasets/out/demo_v2/stage1
-cp datasets/input/example_input.jsonl datasets/out/demo_v2/stage1/input.jsonl
+RUN_DIR=datasets/out/demo_3
 
-# 1) infer
-PYTHONPATH=src python3 src/run_pipeline.py --mode infer --input datasets/out/demo_v2/stage1 --llm-config config/llm_models.json
+# Stage1
+PYTHONPATH=src python3 src/run_pipeline.py --mode infer --input datasets/input --out "$RUN_DIR/stage1" --llm-config config/llm_models.json
+PYTHONPATH=src python3 src/run_pipeline.py --mode eval  --input "$RUN_DIR/stage1" --out "$RUN_DIR/stage1" --llm-config config/llm_models.json
 
-# 2) eval (majority vote)
-PYTHONPATH=src python3 src/run_pipeline.py --mode eval --input datasets/out/demo_v2/stage1 --llm-config config/llm_models.json
+# Stage2 (infer reads infer+status from stage1; writes stage2/infer.jsonl)
+PYTHONPATH=src python3 src/run_pipeline.py --mode infer --input "$RUN_DIR/stage1" --out "$RUN_DIR/stage2" --llm-config config/llm_models.json
+PYTHONPATH=src python3 src/run_pipeline.py --mode eval  --input "$RUN_DIR/stage2" --out "$RUN_DIR/stage2" --llm-config config/llm_models.json
+
+# Stage3 (infer reads infer+status from stage2; writes stage3/infer.jsonl)
+PYTHONPATH=src python3 src/run_pipeline.py --mode infer --input "$RUN_DIR/stage2" --out "$RUN_DIR/stage3" --llm-config config/llm_models.json
+PYTHONPATH=src python3 src/run_pipeline.py --mode eval  --input "$RUN_DIR/stage3" --out "$RUN_DIR/stage3" --llm-config config/llm_models.json
+
+# Final result
+PYTHONPATH=src python3 src/run_pipeline.py --mode result_rebuild --input "$RUN_DIR"
 ```
 
-Optional flags:
+Optional flag:
 - `--sleep`: seconds to sleep between LLM calls (rate limit)
 
 ## vLLM auto-recovery (config-based)
@@ -116,13 +108,7 @@ Outputs (all JSONL) are written under the stage directories inside your run dire
 
 ### Rebuild result/ from existing artifacts
 
-If you already have stage `infer.jsonl` + `status.jsonl` and want to regenerate `result/result.stage_final.jsonl`:
-
-```bash
-PYTHONPATH=src python3 src/run_pipeline.py \
-  --mode result_rebuild \
-  --input datasets/out/demo_v2
-```
+If you already have stage `infer.jsonl` + `status.jsonl` and want to regenerate `result/result.stage_final.jsonl`, use the `result_rebuild` command in the end-to-end block above.
 
 Rebuild rules:
 - Prefer using per-uuid status metadata (`vote_majority_answer_idxs`) to decide exactly which attempts
@@ -131,57 +117,5 @@ Rebuild rules:
 - To avoid collisions, each attempt appends its index to the uuid: `<uuid>-<attempt_idx>`
 Output compaction:
 - `options.compact_outputs=true` only affects optional debug artifacts in other modules.
-  Pipeline v2 always writes the core artifacts: `input.jsonl`, `infer.jsonl`, `status.jsonl`, and `result/result.stage_final.jsonl`.
-
-### Stage2: infer -> eval
-
-Stage2 infer (prefer consuming `stage2_input` task list; fallback: derive it from `stage1_output` + `status.stage1`):
-
-```bash
-PYTHONPATH=src python3 src/run_pipeline.py \
-  --mode stage2_infer \
-  --input datasets/out/demo_modular \
-  --out datasets/out/demo_modular \
-  --llm-config config/llm_models.json
-```
-
-Stage2 eval (consume `stage2_infer` and produce `stage2_archive` + `status.stage2` + `stage3_input`):
-
-```bash
-PYTHONPATH=src python3 src/run_pipeline.py \
-  --mode stage2_eval \
-  --input datasets/out/demo_modular \
-  --out datasets/out/demo_modular \
-  --llm-config config/llm_models.json
-```
-
-### Stage3: infer -> eval
-
-Stage3 infer (consume `stage3_input` and produce `stage3_infer`):
-
-```bash
-PYTHONPATH=src python3 src/run_pipeline.py \
-  --mode stage3_infer \
-  --input datasets/out/demo_modular \
-  --out datasets/out/demo_modular \
-  --llm-config config/llm_models.json
-```
-
-Stage3 eval (consume `stage3_infer` and produce `stage3_archive` + `status.stage3`, and write `result/`):
-
-```bash
-PYTHONPATH=src python3 src/run_pipeline.py \
-  --mode stage3_eval \
-  --input datasets/out/demo_modular \
-  --out datasets/out/demo_modular \
-  --llm-config config/llm_models.json
-```
-
-```bash
-PYTHONPATH=src python3 src/run_pipeline.py \
-  --mode result_rebuild \
-  --input datasets/out/demo_modular \
-  --out datasets/out/demo_modular \
-  --llm-config config/llm_models.json
-```
+  Pipeline v2 always writes the core artifacts: `infer.jsonl`, `status.jsonl`, and `result/result.stage_final.jsonl`.
 

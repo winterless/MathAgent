@@ -7,7 +7,6 @@ Pipeline v2: only three ops
 
 No --stage: stage is inferred from the stage directory name:
   <run_dir>/<stage>/
-    input.jsonl
     infer.jsonl
     status.jsonl
     (optionally) raw_generations.jsonl, archive.jsonl
@@ -23,6 +22,7 @@ import os
 import re
 import sys
 import time
+import fnmatch
 from typing import Any, Dict, Iterable, List, Tuple
 
 from core.stages import append_choice_map_if_any, extract_choice_map, normalize_for_model
@@ -40,14 +40,22 @@ def _run_dir_from_stage_dir(stage_dir: str) -> str:
     return os.path.dirname(os.path.normpath(stage_dir))
 
 
-def _default_next_stage(stage: str) -> str:
-    m = re.match(r"^stage(\d+)$", str(stage).strip().lower())
-    if not m:
+def _out_stage_from_dir(p: str) -> str:
+    """
+    Stage name is derived ONLY from the output directory name.
+    This avoids any implicit "stageK depends on stage(K-1)" assumptions.
+    """
+    base = os.path.basename(os.path.normpath(str(p or ""))).strip()
+    if not base:
         return ""
-    try:
-        return f"stage{int(m.group(1)) + 1}"
-    except Exception:
-        return ""
+    return base
+
+
+def _has_prev_artifacts(dir_path: str) -> bool:
+    """A previous-stage directory is considered valid if it contains infer.jsonl + status.jsonl."""
+    if not dir_path or not os.path.isdir(dir_path):
+        return False
+    return os.path.exists(os.path.join(dir_path, "infer.jsonl")) and os.path.exists(os.path.join(dir_path, "status.jsonl"))
 
 
 def _load_done_uuid_set(path: str) -> set[str]:
@@ -58,6 +66,66 @@ def _load_done_uuid_set(path: str) -> set[str]:
         if isinstance(row, dict) and row.get("uuid") is not None:
             s.add(str(row["uuid"]))
     return s
+
+
+def _input_opts(llm: LLMRouter) -> Dict[str, Any]:
+    """
+    Input behavior is configuration-driven via options.input (a dict).
+
+    Expected keys (all optional):
+    - raw_input_glob: str glob for directory input (default "*.jsonl")
+    - question_key_priority: list[str] (default ["question","prompt","text"])
+    """
+    obj = llm.option_any("input", {})
+    return obj if isinstance(obj, dict) else {}
+
+
+def _iter_raw_input_rows(*, input_path: str, glob: str) -> Iterable[Dict[str, Any]]:
+    """
+    Iterate raw input rows from:
+    - a JSONL file, or
+    - a directory (top-level files matching `glob`, stable order).
+    """
+    if not input_path:
+        raise ValueError("Missing --input")
+    pat = str(glob or "").strip() or "*.jsonl"
+
+    # File
+    if os.path.isfile(input_path):
+        return iter_jsonl(input_path, tolerate_errors=True)
+
+    # Directory
+    if os.path.isdir(input_path):
+        files = sorted([f for f in os.listdir(input_path) if fnmatch.fnmatch(f, pat)])
+        if not files:
+            raise ValueError(f"No files matching {pat} under directory: {input_path}")
+        def _rows() -> Iterable[Dict[str, Any]]:
+            for name in files:
+                p = os.path.join(input_path, name)
+                if not os.path.isfile(p):
+                    continue
+                for row in iter_jsonl(p, tolerate_errors=True):
+                    yield row
+        return _rows()
+
+    raise ValueError(f"--input must be a file or directory for raw infer: {input_path}")
+
+
+def _question_from_row(*, llm: LLMRouter, row: Dict[str, Any]) -> str:
+    """
+    Decide which field(s) constitute the effective question text.
+    This is configuration-driven via options.input.question_key_priority.
+    """
+    keys = _input_opts(llm).get("question_key_priority")
+    if not isinstance(keys, list) or not keys:
+        keys = ["question", "prompt", "text"]
+    for k in keys:
+        if not isinstance(k, str) or not k:
+            continue
+        v = row.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
 
 
 def _extract_answers(*, llm: LLMRouter, stage_solve: str, raw_outputs: List[str]) -> List[str]:
@@ -178,15 +246,17 @@ def _vote_majority(
     }
 
 
-def infer_stage_dir(*, stage_dir: str, llm: LLMRouter, min_votes_to_accept: int, sleep_s: float) -> str:
-    stage = _stage_from_dir(stage_dir)
+def infer_stage_from_raw(*, raw_input_path: str, out_stage_dir: str, llm: LLMRouter, min_votes_to_accept: int, sleep_s: float) -> str:
+    stage = _out_stage_from_dir(out_stage_dir)
+    if not stage:
+        raise ValueError("Missing stage name from --out directory")
     stage_solve = f"{stage}_solve"
-    inp = os.path.join(stage_dir, "input.jsonl")
-    outp = os.path.join(stage_dir, "infer.jsonl")
-    os.makedirs(stage_dir, exist_ok=True)
+    outp = os.path.join(out_stage_dir, "infer.jsonl")
+    os.makedirs(out_stage_dir, exist_ok=True)
 
     done = _load_done_uuid_set(outp)
-    for row0 in iter_jsonl(inp, tolerate_errors=True):
+    pat = str(_input_opts(llm).get("raw_input_glob") or "*.jsonl")
+    for row0 in _iter_raw_input_rows(input_path=raw_input_path, glob=pat):
         if not isinstance(row0, dict):
             continue
         row = normalize_record(row0)
@@ -197,7 +267,7 @@ def infer_stage_dir(*, stage_dir: str, llm: LLMRouter, min_votes_to_accept: int,
         if uuid_key in done:
             continue
 
-        q_raw = row.get("question") if isinstance(row.get("question"), str) else ""
+        q_raw = _question_from_row(llm=llm, row=row)
         if not q_raw.strip():
             raise ValueError(f"Missing question: uuid={uuid}")
         gold = (row.get("answer") or "").strip() if isinstance(row.get("answer"), str) else ""
@@ -236,19 +306,131 @@ def infer_stage_dir(*, stage_dir: str, llm: LLMRouter, min_votes_to_accept: int,
     return outp
 
 
-def eval_stage_dir(*, stage_dir: str, llm: LLMRouter, min_votes_to_accept: int, sleep_s: float) -> str:
-    stage = _stage_from_dir(stage_dir)
+def infer_stage_from_prev(*, input_dir: str, out_stage_dir: str, llm: LLMRouter, min_votes_to_accept: int, sleep_s: float) -> str:
+    """
+    Infer one stage by consuming a directory that contains infer+status (authoritative routing):
+      <input_dir>/infer.jsonl
+      <input_dir>/status.jsonl
+
+    It selects uuids whose status indicates "not accepted" (needs another stage).
+    Backward-compatible with older status schema that used `next_stage`.
+    """
+    stage = _out_stage_from_dir(out_stage_dir)
+    if not stage:
+        raise ValueError("Missing stage name from --out directory")
+    if not _has_prev_artifacts(input_dir):
+        raise ValueError(f"--input must point to a directory containing infer.jsonl + status.jsonl: {input_dir}")
+    prev_infer = os.path.join(input_dir, "infer.jsonl")
+    prev_status = os.path.join(input_dir, "status.jsonl")
+
+    # Build status map
+    status_map: Dict[str, Dict[str, Any]] = {}
+    for st in iter_jsonl(prev_status, tolerate_errors=True):
+        if isinstance(st, dict) and st.get("uuid") is not None:
+            status_map[str(st["uuid"])] = st
+
+    stage_solve = f"{stage}_solve"
+    outp = os.path.join(out_stage_dir, "infer.jsonl")
+    os.makedirs(out_stage_dir, exist_ok=True)
+    # Ensure file exists even if nothing to do.
+    try:
+        with open(outp, "a", encoding="utf-8"):
+            pass
+    except Exception:
+        pass
+
+    done = _load_done_uuid_set(outp)
+    for row in iter_jsonl(prev_infer, tolerate_errors=True):
+        if not isinstance(row, dict):
+            continue
+        uuid = row.get("uuid")
+        if uuid is None:
+            continue
+        uuid_key = str(uuid)
+        if uuid_key in done:
+            continue
+        st = status_map.get(uuid_key, {})
+        if not isinstance(st, dict) or not st:
+            continue
+        # Preferred schema: accepted: bool
+        if "accepted" in st:
+            if bool(st.get("accepted", False)):
+                continue
+        else:
+            # Backward-compat schema: next_stage: str
+            ns = st.get("next_stage")
+            if isinstance(ns, str) and ns.strip():
+                ns_s = ns.strip()
+                # Old convention: "accepted" means stop.
+                if ns_s == "accepted":
+                    continue
+                # Old convention: explicit routing by stage name.
+                # If next_stage points elsewhere, skip this out stage.
+                if ns_s not in ("no_answer",) and ns_s != str(stage):
+                    continue
+                # ns_s == stage OR ns_s == "no_answer" => continue to next stage (sequential).
+            else:
+                # Last resort: infer from vote counts.
+                try:
+                    maj_cnt = int(st.get("vote_majority_count") or 0)
+                except Exception:
+                    maj_cnt = 0
+                try:
+                    mv = int(st.get("min_votes_to_accept") or min_votes_to_accept)
+                except Exception:
+                    mv = int(min_votes_to_accept)
+                if maj_cnt >= mv and str(st.get("vote_majority") or "").strip():
+                    continue
+
+        q_raw = _question_from_row(llm=llm, row=row)
+        if not q_raw.strip():
+            raise ValueError(f"Missing question: uuid={uuid}")
+        gold = (row.get("answer") or "").strip() if isinstance(row.get("answer"), str) else ""
+        model_q = append_choice_map_if_any(normalize_for_model(q_raw))
+        _ = extract_choice_map(model_q)
+
+        stats: Dict[str, int] = {}
+        raws = llm.generate_n(stage_name=stage_solve, question=model_q, prompt_mode="problem", sleep_s=sleep_s, stats=stats)
+        n = int(llm.stage_params(stage_solve).n)
+        raws = [str(x) for x in raws][:n]
+        extracted = _extract_answers(llm=llm, stage_solve=stage_solve, raw_outputs=raws)
+
+        append_jsonl_line(
+            outp,
+            {
+                "uuid": uuid,
+                "line_number": row.get("line_number"),
+                "stage": f"{stage}_infer",
+                "question": q_raw,
+                "answer": gold,
+                "model_input": model_q,
+                "raw_model_outputs": raws,
+                "extracted_answers": extracted,
+                "min_votes_to_accept": int(min_votes_to_accept),
+                "llm_call_counts": {
+                    stage_solve: int(n),
+                    f"{stage_solve}_http_calls": int(stats.get("http_calls", 0)),
+                    f"{stage_solve}_retries": int(stats.get("retries", 0)),
+                    f"{stage_solve}_timeouts": int(stats.get("timeouts", 0)),
+                    f"{stage_solve}_errors": int(stats.get("errors", 0)),
+                },
+                "raw_source_path": row.get("raw_source_path"),
+            },
+        )
+        done.add(uuid_key)
+    return outp
+
+
+def eval_stage_dir(*, input_stage_dir: str, out_stage_dir: str, llm: LLMRouter, min_votes_to_accept: int, sleep_s: float) -> str:
+    stage = _out_stage_from_dir(out_stage_dir)
+    if not stage:
+        raise ValueError("Missing stage name from --out directory")
     stage_eval = f"{stage}_eval"
-    infer_path = os.path.join(stage_dir, "infer.jsonl")
-    status_path = os.path.join(stage_dir, "status.jsonl")
-    os.makedirs(stage_dir, exist_ok=True)
+    infer_path = os.path.join(input_stage_dir, "infer.jsonl")
+    status_path = os.path.join(out_stage_dir, "status.jsonl")
+    os.makedirs(out_stage_dir, exist_ok=True)
 
     done = _load_done_uuid_set(status_path)
-    run_dir = _run_dir_from_stage_dir(stage_dir)
-    next_stage = _default_next_stage(stage)
-    next_input_path = os.path.join(run_dir, next_stage, "input.jsonl") if next_stage else ""
-    if next_stage:
-        os.makedirs(os.path.join(run_dir, next_stage), exist_ok=True)
 
     for row in iter_jsonl(infer_path, tolerate_errors=True):
         if not isinstance(row, dict):
@@ -260,7 +442,7 @@ def eval_stage_dir(*, stage_dir: str, llm: LLMRouter, min_votes_to_accept: int, 
         if uuid_key in done:
             continue
 
-        q_raw = row.get("question") if isinstance(row.get("question"), str) else ""
+        q_raw = _question_from_row(llm=llm, row=row)
         model_q = row.get("model_input") if isinstance(row.get("model_input"), str) else append_choice_map_if_any(normalize_for_model(q_raw))
         choice_map = extract_choice_map(model_q)
         extracted = row.get("extracted_answers") if isinstance(row.get("extracted_answers"), list) else []
@@ -281,7 +463,8 @@ def eval_stage_dir(*, stage_dir: str, llm: LLMRouter, min_votes_to_accept: int, 
         keep = vote.get("majority_answer_idxs") if isinstance(vote.get("majority_answer_idxs"), list) else []
 
         accepted = bool(maj and maj_cnt >= int(min_votes_to_accept))
-        ns = "accepted" if accepted else (next_stage or "no_answer")
+        # Backward-compat field: keep next_stage string for older tooling.
+        next_stage = "accepted" if accepted else "no_answer"
 
         append_jsonl_line(
             status_path,
@@ -300,7 +483,9 @@ def eval_stage_dir(*, stage_dir: str, llm: LLMRouter, min_votes_to_accept: int, 
                 "final_answer": maj if accepted else "",
                 "final_source": "majority" if accepted else "no_majority",
                 "final_vote_count": int(maj_cnt),
-                "next_stage": ns,
+                # No fixed "next stage" name. Consumers should use accepted=false to decide whether to continue.
+                "accepted": bool(accepted),
+                "next_stage": next_stage,
                 "paths": {"infer": infer_path},
                 "llm_call_counts": {
                     **(row.get("llm_call_counts") if isinstance(row.get("llm_call_counts"), dict) else {}),
@@ -312,15 +497,6 @@ def eval_stage_dir(*, stage_dir: str, llm: LLMRouter, min_votes_to_accept: int, 
             },
         )
         done.add(uuid_key)
-
-        # Emit next-stage task list (always, even in compact mode).
-        if (not accepted) and next_input_path:
-            append_jsonl_line(
-                next_input_path,
-                {
-                    **{k: row.get(k) for k in CANONICAL_KEYS},
-                },
-            )
     return status_path
 
 
@@ -367,7 +543,7 @@ def result_rebuild_run_dir(*, run_dir: str, min_votes_to_accept: int) -> str:
                 continue
             raws = row.get("raw_model_outputs") if isinstance(row.get("raw_model_outputs"), list) else []
             extracted = row.get("extracted_answers") if isinstance(row.get("extracted_answers"), list) else []
-            q = row.get("question")
+            q = row.get("question") or row.get("prompt") or row.get("text") or ""
             for idx in keep:
                 if not isinstance(idx, int):
                     continue
@@ -388,7 +564,13 @@ def main() -> None:
     p.add_argument(
         "--input",
         required=True,
-        help="For infer/eval: a stage directory <run_dir>/<stage>. For result_rebuild: the run_dir.",
+        help="For infer: a raw JSONL file/dir OR a directory containing infer.jsonl + status.jsonl. For eval: a stage directory containing infer.jsonl. For result_rebuild: the run_dir.",
+    )
+    p.add_argument(
+        "--out",
+        required=False,
+        default="",
+        help="Required for infer/eval: output stage directory. For result_rebuild: unused.",
     )
     p.add_argument("--llm-config", default="config/llm_models.json")
     p.add_argument("--sleep", type=float, default=0.0)
@@ -396,6 +578,7 @@ def main() -> None:
 
     llm = LLMRouter(config_path=args.llm_config)
     min_votes_to_accept = llm.threshold_int("min_votes_to_accept", 5)
+    in_opts = _input_opts(llm)
 
     # Only infer/eval need LLM connectivity.
     if args.mode in ("infer", "eval"):
@@ -407,20 +590,42 @@ def main() -> None:
 
     inp = str(args.input)
     if args.mode in ("infer", "eval"):
-        stage_dir = inp
-        if not os.path.isdir(stage_dir):
-            raise ValueError(f"--input must be a stage directory for mode={args.mode}: {inp}")
-        # Ensure input.jsonl exists for infer
+        out_dir = str(args.out or "").strip()
+        if not out_dir:
+            raise ValueError("--out must be provided for mode=infer/eval (output stage directory).")
         if args.mode == "infer":
-            in_file = os.path.join(stage_dir, "input.jsonl")
-            if not os.path.exists(in_file):
-                raise ValueError(f"Missing {in_file}. Put tasks there before infer.")
-            outp = infer_stage_dir(stage_dir=stage_dir, llm=llm, min_votes_to_accept=min_votes_to_accept, sleep_s=float(args.sleep))
+            # If input points to a directory with infer+status -> derive tasks from it.
+            if _has_prev_artifacts(inp):
+                outp = infer_stage_from_prev(
+                    input_dir=inp,
+                    out_stage_dir=out_dir,
+                    llm=llm,
+                    min_votes_to_accept=min_votes_to_accept,
+                    sleep_s=float(args.sleep),
+                )
+            else:
+                # Otherwise treat input as raw dataset (file/dir).
+                outp = infer_stage_from_raw(
+                    raw_input_path=inp,
+                    out_stage_dir=out_dir,
+                    llm=llm,
+                    min_votes_to_accept=min_votes_to_accept,
+                    sleep_s=float(args.sleep),
+                )
         else:
-            inf_file = os.path.join(stage_dir, "infer.jsonl")
+            # Eval reads infer.jsonl from input stage dir and writes status.jsonl to out stage dir.
+            if not os.path.isdir(inp):
+                raise ValueError(f"--input must be a stage directory for mode=eval: {inp}")
+            inf_file = os.path.join(inp, "infer.jsonl")
             if not os.path.exists(inf_file):
                 raise ValueError(f"Missing {inf_file}. Run infer first.")
-            outp = eval_stage_dir(stage_dir=stage_dir, llm=llm, min_votes_to_accept=min_votes_to_accept, sleep_s=float(args.sleep))
+            outp = eval_stage_dir(
+                input_stage_dir=inp,
+                out_stage_dir=out_dir,
+                llm=llm,
+                min_votes_to_accept=min_votes_to_accept,
+                sleep_s=float(args.sleep),
+            )
         print(outp)
         return
 
