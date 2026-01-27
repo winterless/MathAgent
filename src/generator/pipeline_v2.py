@@ -584,9 +584,29 @@ def main() -> None:
     )
     p.add_argument("--llm-config", default="config/llm_models.json")
     p.add_argument("--sleep", type=float, default=0.0)
+    p.add_argument(
+        "--vllm-model",
+        default=None,
+        help="Override vLLM model path (overrides config/llm_models.json options.vllm_model_path)",
+    )
+    p.add_argument(
+        "--vllm-served-model-name",
+        default=None,
+        help="Override vLLM served model name (overrides config/llm_models.json options.vllm_model_name)",
+    )
     args = p.parse_args()
 
     llm = LLMRouter(config_path=args.llm_config)
+    
+    # Override vLLM options from command line if provided
+    override_opts = {}
+    if args.vllm_model is not None:
+        override_opts["vllm_model_path"] = args.vllm_model
+    if args.vllm_served_model_name is not None:
+        override_opts["vllm_model_name"] = args.vllm_served_model_name
+    if override_opts:
+        llm.override_options(override_opts)
+    
     min_votes_to_accept = llm.threshold_int("min_votes_to_accept", 5)
     in_opts = _input_opts(llm)
 

@@ -120,6 +120,26 @@ PYTHONPATH=src python3 src/run_pipeline.py --mode result_rebuild --input "$RUN_D
 - `vllm_restart_on_connrefused`：遇到 Connection refused 时用同一命令重启。
 - `vllm_health_url`、`vllm_start_cmd`、`vllm_wait_s`、`vllm_restart_cmd`、`vllm_stop_cmd`、`vllm_log_path` 等用于控制启动/停止与日志。
 
+#### 命令行参数覆盖
+
+可以通过命令行参数动态覆盖配置文件中的 vLLM 模型设置：
+
+```bash
+# 覆盖模型路径和名称
+PYTHONPATH=src python3 src/run_pipeline.py \
+    --mode infer \
+    --input datasets/input \
+    --out "$RUN_DIR/stage1" \
+    --vllm-model /path/to/your/model \
+    --vllm-served-model-name YourModelName \
+    --llm-config config/llm_models.json
+```
+
+- `--vllm-model`：覆盖 `config/llm_models.json` 中的 `options.vllm_model_path`
+- `--vllm-served-model-name`：覆盖 `config/llm_models.json` 中的 `options.vllm_model_name`
+
+这些参数会覆盖配置文件中的对应值，方便在运行时切换不同的模型。
+
 ### result_rebuild 说明
 
 在已有各 stage 的 `infer.jsonl` 与 `status.jsonl` 时，可用 `result_rebuild` 重新生成 `result/result.stage_final.jsonl`。结果模式会按 status 中的投票/接受信息决定写入内容；每条结果可带 attempt 下标避免冲突。
