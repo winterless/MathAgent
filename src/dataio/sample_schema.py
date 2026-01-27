@@ -4,111 +4,77 @@ from typing import Any, Dict, List
 
 JsonDict = Dict[str, Any]
 
-# Canonical top-level keys we want to match (based on datasets/sample.jsonl).
-CANONICAL_KEYS = [
-    "source_category",
-    "text",
-    "uuid",
-    "provider",
-    "version",
-    "xx_version",
-    "aigc_modelname",
-    "language",
-    "raw_source_path",
-    "prompt",
-    "question",
-    "answer",
-    "line_number",
-    "output",
+# Default canonical keys (fallback if not in config)
+# Only includes fields that are actually used in the pipeline
+_DEFAULT_CANONICAL_KEYS = [
+    "uuid",           # Required: used for deduplication
+    "question",       # Used: extracted via question_key_priority
+    "prompt",         # Used: extracted via question_key_priority
+    "text",           # Used: extracted via question_key_priority
+    "answer",         # Optional: used as gold answer
+    "line_number",    # Optional: used for tracking
+    "raw_source_path", # Optional: used for tracking source
 ]
 
 
-def normalize_output_wrapper(output: Any, *, uuid: Any = None, stage: str = "stage1") -> JsonDict:
+def get_canonical_keys(canonical_keys: List[str] | None = None) -> List[str]:
     """
-    Normalize an "output" wrapper to match datasets/sample.jsonl's shape as closely as possible.
-    Unknown fields are mocked with safe defaults.
+    Get canonical keys from config or use default.
+    
+    Args:
+        canonical_keys: List of keys from config, or None to use default
+    
+    Returns:
+        List of canonical keys
     """
-    existing = output if isinstance(output, dict) else {}
-    existing_content = existing.get("content") if isinstance(existing.get("content"), dict) else {}
+    if canonical_keys and isinstance(canonical_keys, list) and len(canonical_keys) > 0:
+        return [str(k) for k in canonical_keys if isinstance(k, str) and k]
+    return _DEFAULT_CANONICAL_KEYS.copy()
 
-    content_str = ""
-    tool_calls = None
-    if isinstance(existing_content, dict):
-        choices = existing_content.get("choices")
-        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-            msg = choices[0].get("message")
-            if isinstance(msg, dict):
-                if isinstance(msg.get("content"), str):
-                    content_str = msg["content"]
-                tool_calls = msg.get("tool_calls", None)
 
-    out_choices: List[JsonDict] = []
-    if isinstance(existing_content.get("choices"), list) and existing_content["choices"]:
-        c0 = existing_content["choices"][0]
-        if not isinstance(c0, dict):
-            c0 = {}
-        msg0 = c0.get("message") if isinstance(c0.get("message"), dict) else {}
-        out_choices.append(
-            {
-                "indext": int(c0.get("indext", 0)) if str(c0.get("indext", "0")).isdigit() else 0,
-                "message": {
-                    "role": msg0.get("role", "assistant"),
-                    "content": msg0.get("content", content_str),
-                    "tool_calls": msg0.get("tool_calls", tool_calls),
-                },
-                "logprobs": c0.get("logprobs", None),
-                "finish_reason": c0.get("finish_reason", "stop"),
-            }
-        )
-    else:
-        out_choices.append(
-            {
-                "indext": 0,
-                "message": {"role": "assistant", "content": content_str, "tool_calls": tool_calls},
-                "logprobs": None,
-                "finish_reason": "stop",
-            }
+def validate_question_key_priority(question_key_priority: List[str], canonical_keys: List[str]) -> None:
+    """
+    Validate that all keys in question_key_priority exist in canonical_keys.
+    
+    Args:
+        question_key_priority: List of question field names to check
+        canonical_keys: List of canonical keys from config
+    
+    Raises:
+        ValueError: If any key in question_key_priority is not in canonical_keys
+    """
+    if not isinstance(question_key_priority, list):
+        return
+    
+    canonical_set = set(canonical_keys)
+    missing = [k for k in question_key_priority if k not in canonical_set]
+    
+    if missing:
+        raise ValueError(
+            f"question_key_priority contains keys not in canonical_keys: {missing}. "
+            f"Available keys: {canonical_keys}"
         )
 
-    usage = existing_content.get("usage") if isinstance(existing_content.get("usage"), dict) else {}
-    out_usage = {
-        "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
-        "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
-        "total_tokens": int(usage.get("total_tokens", 0) or 0),
-    }
 
-    prefill_time = existing_content.get("prefill_time", 0)
-    if not isinstance(prefill_time, (int, float)):
-        prefill_time = 0
-
-    out_content: JsonDict = {
-        "id": existing_content.get("id", f"endpoint_{stage}_{uuid}" if uuid is not None else f"endpoint_{stage}_unknown"),
-        "object": existing_content.get("object", 0),
-        "model": existing_content.get("model", ""),
-        "choices": out_choices,
-        "usage": out_usage,
-        "prefill_time": prefill_time,
-    }
-
-    status = existing.get("status", "SUCCESS")
-    if not isinstance(status, str) or not status:
-        status = "SUCCESS"
-
-    return {"status": status, "content": out_content}
-
-
-def normalize_record(row: JsonDict) -> JsonDict:
+def normalize_record(row: JsonDict, *, canonical_keys: List[str] | None = None) -> JsonDict:
     """
-    Return a new dict that:
-    - Contains exactly CANONICAL_KEYS (no extras)
-    - Fills missing keys with ""/None defaults
-    - Normalizes row["output"] to the sample-like wrapper
+    Normalize input record: extract only useful fields and remove extras.
+    Only preserves fields that are actually used in the pipeline.
+    
+    Args:
+        row: Input record to normalize
+        canonical_keys: List of canonical keys from config. If None, uses default.
+    
+    Returns:
+        Normalized record with only canonical keys (extra fields removed)
     """
+    keys = get_canonical_keys(canonical_keys)
     out: JsonDict = {}
-    for k in CANONICAL_KEYS:
-        out[k] = row.get(k, "" if k not in ("line_number", "output") else (None if k == "line_number" else {}))
-
-    out["output"] = normalize_output_wrapper(row.get("output"), uuid=out.get("uuid"), stage="input")
+    for k in keys:
+        if k == "line_number":
+            out[k] = row.get(k, None)
+        else:
+            out[k] = row.get(k, "")
     return out
 
 

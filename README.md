@@ -59,7 +59,7 @@
 
 | 层次 | 路径 | 说明 |
 |------|------|------|
-| **CLI / 编排** | `src/run_pipeline.py` | 唯一入口；支持 Route-A modular 与 scenario；工件落盘、断点续跑、路由、启动时 connection-error 清理 |
+| **CLI / 编排** | `src/run_pipeline.py` | 唯一入口；工件落盘、断点续跑、路由、启动时 connection-error 清理 |
 | **Generator（通用底座）** | `src/generator/` | 按配置顺序执行步骤；scenario 配置（如 `steps[]`、`${RAW_INPUT}` / `${OUT_DIR}`） |
 | **Core（可替换领域）** | `src/core/` | 当前实现为示例场景的领域逻辑（见第 8 节），可替换 |
 | **IO** | `src/dataio/` | JSONL 读写、schema 归一 |
@@ -83,7 +83,7 @@
 ## 6. 运行时稳定性
 
 - **vLLM connection refused**：由 `config/llm_models.json` 的 `options` 或环境变量驱动等待/重启与健康检查（详见配置与代码内注释）。
-- **启动时清理 connection-error 数据**：默认扫描 `--out` 下派生 JSONL，移除含 connection/network error marker 的 uuid 对应行，使重跑能再次处理这些样本；不删除 stage0、stage2_input、stage3_input、stage1_output。可通过配置关闭。
+- **启动时清理 LLM-error 数据**：默认扫描 `--out` 下派生 JSONL，移除含 **任何 LLM_ERROR 关键字**（包括 connection/network error）的 uuid 对应行，使重跑能再次处理这些样本。每次清理后会将进度记录到输出目录的 `.cleanup_progress.json`（记录 mode、时间戳、被清理的 uuid、各文件删除行数等）。可通过配置关闭。
 
 ---
 
@@ -130,7 +130,7 @@ PYTHONPATH=src python3 src/run_pipeline.py --mode result_rebuild --input "$RUN_D
 
 上文为泛化框架的完整说明；此处用**一个小例子**说明当前仓库的落地方式：**数学题多轮推理 + 多数投票**。
 
-- **在框架中的位置**：一种可替换的 scenario；轮次与步骤由 `config/scenarios/*.json` 描述（如 `stage1_infer → stage1_eval → stage2_infer → … → result_rebuild`），不写死在引擎里。
+- **在框架中的位置**：通过多次调用 `infer` 和 `eval` 实现多轮投票；轮次由目录结构体现（如 `stage1/` → `stage2/` → `stage3/`），不写死在引擎里。
 - **在做什么**：
   - **infer**：对每题多采样得到多个候选答案。
   - **eval**：规则抽取（如 `\boxed{}` / `FINAL:`）+ 规则等价判别 + 必要时 LLM 裁决，再做**多数投票**与收敛判断；未收敛则进入下一轮 infer/eval。
@@ -138,16 +138,16 @@ PYTHONPATH=src python3 src/run_pipeline.py --mode result_rebuild --input "$RUN_D
 
 ```mermaid
 flowchart TD
-    A[run_pipeline.py] --> B[stage1_output.stage1.jsonl]
-    B --> C[stage1_eval]
-    C --> D[stage2_infer]
-    D --> E[stage2_eval]
-    E --> F[stage3_infer]
-    F --> G[stage3_eval]
+    A[run_pipeline.py] --> B[stage1/infer.jsonl]
+    B --> C[stage1/eval]
+    C --> D[stage2/infer.jsonl]
+    D --> E[stage2/eval]
+    E --> F[stage3/infer.jsonl]
+    F --> G[stage3/eval]
     G --> H[result_rebuild]
 ```
 
-- **代码对应**：Core 中的 `stages.py`（输入归一、选项映射、答案抽取、规则等价、Stage1 boxed 统计）、`prompt_assemble.py`（eval prompt 拼装）、`voting.py`（多数投票）；配置中的 `thresholds.min_votes_to_accept`、`stage_params` 等为本示例所用。
+- **代码对应**：Core 中的 `stages.py`（输入归一、选项映射、答案抽取、规则等价、Stage1 boxed 统计）、`voting.py`（多数投票）；配置中的 `thresholds.min_votes_to_accept`、`stage_params` 等为本示例所用。
 - **本示例下的数据流要点**：Stage1 solve 落盘 stage1 infer，eval 写 status 并路由到 Stage2；Stage2/3 类似，infer 写 raw/抽取结果，eval 写 status 与 accepted_bank；`result/*.result.stage_final.jsonl` 仅收录 `final_source="majority"` 的样本。
 - **本示例的规格约定**：抽取优先级 `extract_boxed_answer` > `extract_final_answer`；规则判别优先，仅当 `rule_equivalent` 返回 `None` 时调用 LLM judge；多数投票基于规范化答案并过滤空答案；`majority_count >= min_votes_to_accept` 时为 `final_source="majority"`，否则为 `no_majority`。
 

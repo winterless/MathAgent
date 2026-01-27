@@ -67,7 +67,7 @@
     "stage3_eval":  { "n": 1, "temperature": 0, "max_tokens": 16384 }
   },
   "thresholds": {
-    "min_votes_to_accept": 3
+    "min_votes_to_accept": 4
   },
   "options": {
     "__comment_debug": "Debug / logging",
@@ -88,7 +88,16 @@
       "allow_raw_input_for_infer": true,
       "raw_input_stage": "stage1",
       "raw_input_glob": "*.jsonl",
-      "question_key_priority": ["question", "prompt", "text"]
+      "question_key_priority": ["question", "prompt", "text"],
+      "canonical_keys": [
+        "uuid",
+        "question",
+        "prompt",
+        "text",
+        "answer",
+        "line_number",
+        "raw_source_path"
+      ]
     },
 
     "__comment_answer_extract": "Answer extraction (non-LLM)",

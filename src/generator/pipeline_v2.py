@@ -25,9 +25,9 @@ import time
 import fnmatch
 from typing import Any, Dict, Iterable, List, Tuple
 
-from core.stages import append_choice_map_if_any, extract_choice_map, normalize_for_model
+from core.stages import normalize_for_model
 from dataio.jsonl_io import append_jsonl_line, iter_jsonl, write_jsonl_atomic
-from dataio.sample_schema import CANONICAL_KEYS, normalize_record
+from dataio.sample_schema import get_canonical_keys, normalize_record, validate_question_key_priority
 from infra.llm_helper import maybe_autostart_vllm, maybe_shutdown_vllm
 from infra.llm_router import LLMRouter
 
@@ -75,9 +75,17 @@ def _input_opts(llm: LLMRouter) -> Dict[str, Any]:
     Expected keys (all optional):
     - raw_input_glob: str glob for directory input (default "*.jsonl")
     - question_key_priority: list[str] (default ["question","prompt","text"])
+    - canonical_keys: list[str] (default: predefined list)
     """
     obj = llm.option_any("input", {})
     return obj if isinstance(obj, dict) else {}
+
+
+def _get_canonical_keys(llm: LLMRouter) -> List[str]:
+    """Get canonical keys from config."""
+    input_opts = _input_opts(llm)
+    canonical_keys = input_opts.get("canonical_keys")
+    return get_canonical_keys(canonical_keys)
 
 
 def _iter_raw_input_rows(*, input_path: str, glob: str) -> Iterable[Dict[str, Any]]:
@@ -115,10 +123,17 @@ def _question_from_row(*, llm: LLMRouter, row: Dict[str, Any]) -> str:
     """
     Decide which field(s) constitute the effective question text.
     This is configuration-driven via options.input.question_key_priority.
+    Validates that question_key_priority keys exist in canonical_keys.
     """
-    keys = _input_opts(llm).get("question_key_priority")
+    input_opts = _input_opts(llm)
+    keys = input_opts.get("question_key_priority")
     if not isinstance(keys, list) or not keys:
         keys = ["question", "prompt", "text"]
+    
+    # Validate that all keys in question_key_priority exist in canonical_keys
+    canonical_keys = _get_canonical_keys(llm)
+    validate_question_key_priority(keys, canonical_keys)
+    
     for k in keys:
         if not isinstance(k, str) or not k:
             continue
@@ -155,7 +170,6 @@ def _vote_majority(
     stage_eval: str,
     question_raw: str,
     candidates: List[str],
-    choice_map: Dict[str, str],
     sleep_s: float,
     stats: Dict[str, int] | None,
 ) -> Dict[str, Any]:
@@ -259,7 +273,8 @@ def infer_stage_from_raw(*, raw_input_path: str, out_stage_dir: str, llm: LLMRou
     for row0 in _iter_raw_input_rows(input_path=raw_input_path, glob=pat):
         if not isinstance(row0, dict):
             continue
-        row = normalize_record(row0)
+        canonical_keys = _get_canonical_keys(llm)
+        row = normalize_record(row0, canonical_keys=canonical_keys)
         uuid = row.get("uuid")
         if uuid is None:
             continue
@@ -271,8 +286,7 @@ def infer_stage_from_raw(*, raw_input_path: str, out_stage_dir: str, llm: LLMRou
         if not q_raw.strip():
             raise ValueError(f"Missing question: uuid={uuid}")
         gold = (row.get("answer") or "").strip() if isinstance(row.get("answer"), str) else ""
-        model_q = append_choice_map_if_any(normalize_for_model(q_raw))
-        _ = extract_choice_map(model_q)
+        model_q = normalize_for_model(q_raw)
 
         stats: Dict[str, int] = {}
         raws = llm.generate_n(stage_name=stage_solve, question=model_q, prompt_mode="problem", sleep_s=sleep_s, stats=stats)
@@ -386,8 +400,7 @@ def infer_stage_from_prev(*, input_dir: str, out_stage_dir: str, llm: LLMRouter,
         if not q_raw.strip():
             raise ValueError(f"Missing question: uuid={uuid}")
         gold = (row.get("answer") or "").strip() if isinstance(row.get("answer"), str) else ""
-        model_q = append_choice_map_if_any(normalize_for_model(q_raw))
-        _ = extract_choice_map(model_q)
+        model_q = normalize_for_model(q_raw)
 
         stats: Dict[str, int] = {}
         raws = llm.generate_n(stage_name=stage_solve, question=model_q, prompt_mode="problem", sleep_s=sleep_s, stats=stats)
@@ -443,8 +456,6 @@ def eval_stage_dir(*, input_stage_dir: str, out_stage_dir: str, llm: LLMRouter, 
             continue
 
         q_raw = _question_from_row(llm=llm, row=row)
-        model_q = row.get("model_input") if isinstance(row.get("model_input"), str) else append_choice_map_if_any(normalize_for_model(q_raw))
-        choice_map = extract_choice_map(model_q)
         extracted = row.get("extracted_answers") if isinstance(row.get("extracted_answers"), list) else []
         extracted_trim = [str(x or "").strip() for x in extracted]
 
@@ -454,7 +465,6 @@ def eval_stage_dir(*, input_stage_dir: str, out_stage_dir: str, llm: LLMRouter, 
             stage_eval=stage_eval,
             question_raw=q_raw,
             candidates=extracted_trim,
-            choice_map=choice_map,
             sleep_s=sleep_s,
             stats=vote_stats,
         )
@@ -593,6 +603,26 @@ def main() -> None:
         out_dir = str(args.out or "").strip()
         if not out_dir:
             raise ValueError("--out must be provided for mode=infer/eval (output stage directory).")
+        # Check for common issues: empty variable expansion (e.g., "$RUN_DIR/stage1" when RUN_DIR is unset)
+        if out_dir.startswith("/") and len([p for p in out_dir.split(os.path.sep) if p]) <= 1:
+            original_out = str(args.out or "").strip()
+            raise ValueError(
+                f"Invalid output directory: {out_dir}\n"
+                f"  Original argument: --out '{original_out}'\n"
+                f"  This looks like an unset environment variable (e.g., $RUN_DIR/stage1 when RUN_DIR is empty).\n"
+                f"  Please ensure environment variables are set, or use a relative path like 'datasets/out/demo_3/stage1'."
+            )
+        # Normalize path: convert relative paths to absolute based on current working directory
+        if not os.path.isabs(out_dir):
+            out_dir = os.path.abspath(out_dir)
+        # Safety check: prevent creating directories directly in root filesystem
+        path_parts = [p for p in out_dir.split(os.path.sep) if p]
+        if out_dir.startswith(os.path.sep) and len(path_parts) <= 1:
+            raise ValueError(
+                f"Invalid output directory: {out_dir}. "
+                f"Cannot create directories directly in root filesystem. "
+                f"Please use a relative path (e.g., 'datasets/out/demo_3/stage1') or an absolute path within your project directory."
+            )
         if args.mode == "infer":
             # If input points to a directory with infer+status -> derive tasks from it.
             if _has_prev_artifacts(inp):
